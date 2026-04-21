@@ -1,0 +1,79 @@
+# ============================================================
+# JobScout — .gitignore
+# ============================================================
+
+# --- Secrets & config locaux (NE JAMAIS COMMITTER) ----------
+.env
+*.env.local
+*.env.production
+*.env.staging
+
+# --- Base de données SQLite --------------------------------
+*.db
+*.db-shm
+*.db-wal
+data/
+/data/
+
+# --- Python ------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.whl
+.installed.cfg
+
+# --- Environnements virtuels -------------------------------
+.venv/
+venv/
+env/
+ENV/
+.env.bak
+
+# --- Jupyter -----------------------------------------------
+.ipynb_checkpoints/
+*.ipynb
+
+# --- OS / éditeurs -----------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.code-workspace
+
+# --- Docker ------------------------------------------------
+# (les images sont reconstruites depuis les Dockerfiles)
+# Pas de volumes locaux à committer
+
+# --- Logs --------------------------------------------------
+*.log
+logs/
+
+# --- Playwright --------------------------------------------
+playwright/.auth/
+test-results/
+playwright-report/
+
+# --- Divers ------------------------------------------------
+*.bak
+*.tmp
+*.orig
+.cache/
