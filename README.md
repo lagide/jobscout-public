@@ -42,7 +42,7 @@ interview / closed) with temporal reminders, **4 thematic dashboards**
 | Workday | Public careers REST | Global | `Name\|URL` entries |
 | Remotive | Public API | Global remote | Free tier |
 | Himalayas | Public API | Global remote | Free tier |
-| FreeWork | HTML (requests) | France (freelance) | — |
+| FreeWork | HTML (requests) | France (freelance) | - |
 | APEC | Playwright (headless Chromium) | France (cadres) | Optional |
 
 New connectors subclass `BaseConnector` and register themselves in
@@ -63,8 +63,8 @@ self-disable silently.
 
 **Key design choices:**
 - **Prompt caching** on the Claude system prompt (~90% cost reduction on repeat scoring).
-- **Python-side deterministic scoring** for geo/salary/freshness — Claude only handles content quality, so a calibration change doesn't require a re-call.
-- **Content-hash deduplication** across platforms — the same role on LinkedIn and FranceTravail collapses into one row with a `sources` array.
+- **Python-side deterministic scoring** for geo/salary/freshness - Claude only handles content quality, so a calibration change doesn't require a re-call.
+- **Content-hash deduplication** across platforms - the same role on LinkedIn and FranceTravail collapses into one row with a `sources` array.
 - **SSE-free UI**: Streamlit polls `/jobs` with filters; heavy lifting (scraping, scoring) runs in `BackgroundTasks`.
 
 ## Quickstart
@@ -74,7 +74,7 @@ self-disable silently.
 git clone https://github.com/lagide/jobscout-public.git
 cd jobscout-public
 cp .env.example .env
-# Edit .env — minimum required: OPENROUTER_API_KEY
+# Edit .env - minimum required: OPENROUTER_API_KEY
 
 # 2) Launch
 docker compose up -d --build
@@ -106,28 +106,28 @@ Optional:
 | `SCHEDULED_PROFILES` | `France` | Comma-separated geo profiles |
 | `REFRESH_INTERVAL_HOURS` | `24` | Scheduler cadence |
 | `SCORING_CONCURRENCY` | `4` | Parallel Claude requests |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | — | Push notifications on high-scoring offers |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | - | Push notifications on high-scoring offers |
 
 ## Adapting the scoring to your context
 
 The default geographic scoring assumes the user lives outside Paris but
 within commute range (Northern France). To adapt:
 
-1. **`backend/enrichment.py` → `_PARIS_RE`**: swap the regex for your own
+1. **`backend/enrichment.py` -> `_PARIS_RE`**: swap the regex for your own
    target hub (e.g. Lyon, Geneva, Luxembourg departments/cities).
-2. **`backend/enrichment.py` → `compute_geo_score`**: tune the score ladder
+2. **`backend/enrichment.py` -> `compute_geo_score`**: tune the score ladder
    (remote-days thresholds, onsite penalties).
-3. **`backend/scoring.py` → `SYSTEM_PROMPT`**: edit the target roles, seniority,
+3. **`backend/scoring.py` -> `SYSTEM_PROMPT`**: edit the target roles, seniority,
    and skill focus. Currently tuned for senior IT management (TAM, CIO, CISO,
    CTO, IT Director, Infrastructure Lead).
-4. **`backend/enrichment.py` → `_SALARY_BRACKETS`**: adjust the EUR thresholds
+4. **`backend/enrichment.py` -> `_SALARY_BRACKETS`**: adjust the EUR thresholds
    for your seniority level.
 
 ## Cost reference
 
 With Claude Haiku 4.5 via OpenRouter and prompt caching enabled:
 - **~$2 per 1,000 scored offers** (system prompt cache hits ~90%).
-- A typical scrape brings 50–150 new offers/day → **~$0.10–0.30/day**.
+- A typical scrape brings 50–150 new offers/day -> **~$0.10–0.30/day**.
 - Switching to Opus 4.7 is ~20× more expensive but marginally better on ambiguous roles.
 
 ## Stack
@@ -164,7 +164,7 @@ jobscout/
 
 ## License
 
-MIT — see `LICENSE`.
+MIT - see `LICENSE`.
 
 ## Disclaimer
 
