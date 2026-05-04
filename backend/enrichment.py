@@ -1,21 +1,14 @@
-"""Offer enrichment — pure helpers that infer additional fields from raw text.
+"""Enrichissement des offres — helpers purs qui dérivent des champs depuis le texte brut.
 
-All functions are synchronous and side-effect free: they read a job's title/description
-and return a best-effort classification. When signals are ambiguous they return None
-rather than guessing.
+Toutes les fonctions sont synchrones et sans effet de bord : elles lisent le
+titre/description et renvoient une classification best-effort. En cas d'ambiguïté,
+on retourne None plutôt que de deviner.
 
-Scoring components (Phase 4):
-  compute_geo_score()       — geographic accessibility from the user's home location
-                              (default calibration: Northern France, Paris-accessible)
-  compute_salary_score()    — annualised EUR salary vs. seniority thresholds
-  compute_freshness_score() — temporal decay from posting date
-  compute_final_score()     — weighted combination of all four axes (incl. Claude content)
-
-NOTE — Geographic calibration:
-  The `_PARIS_RE` regex and the scoring ladder in `compute_geo_score` are tuned
-  for a user commuting to Paris from the Hauts-de-France region. To adapt to
-  another context, edit the regex (or replace with your own "target hub" pattern)
-  and adjust the score ladder accordingly.
+Composantes de scoring (Phase 4) :
+  compute_geo_score()       — accessibilité géographique depuis ta localisation (à calibrer dans compute_geo_score)
+  compute_salary_score()    — salaire annualisé EUR vs. seuils de seniorité
+  compute_freshness_score() — décroissance temporelle depuis la date de publication
+  compute_final_score()     — combinaison pondérée des 4 axes (incluant le score Claude)
 """
 from __future__ import annotations
 
@@ -122,61 +115,11 @@ def detect_language(text: Optional[str]) -> Optional[str]:
 
 
 # ============================================================
-# Seniority detection (kept for reference / backward compat)
+# Geographic scoring — calibrate compute_geo_score() to YOUR home location
 # ============================================================
-
-JUNIOR_RE = re.compile(
-    r"\b(junior|d[ée]butant(e)?|apprenti(e)?|"
-    r"alternan(t|ce)|"
-    r"stage(?!r)|stagiaire|"
-    r"intern|internship|"
-    r"bac\s*\+\s*2|"
-    r"sans\s+exp[ée]rience|"
-    r"0\s*[-–]\s*2\s+ans)\b",
-    re.IGNORECASE,
-)
-
-SENIOR_RE = re.compile(
-    r"\b(senior|sr\.?|lead|head|directeur|directrice|"
-    r"responsable|architecte|expert(e)?|principal|"
-    r"rssi|ciso|dsi|cto)\b",
-    re.IGNORECASE,
-)
-
-
-def classify_seniority(title: str) -> tuple[bool, bool]:
-    """Return (is_senior, is_junior) flags from the title."""
-    t = title or ""
-    return (bool(SENIOR_RE.search(t)), bool(JUNIOR_RE.search(t)))
-
-
-def adjust_score(
-    base_score: Optional[float], title: str, description: Optional[str] = None
-) -> Optional[float]:
-    """Legacy title-based adjustment — kept for backward compatibility.
-
-    In the new multi-criteria scoring pipeline this is NOT called:
-    compute_final_score() is used instead. This function remains available
-    for any old code paths that still reference it.
-    """
-    if base_score is None:
-        return None
-    is_senior, is_junior = classify_seniority(title)
-    s = float(base_score)
-    if is_junior:
-        s = min(s, 2.0)
-    if is_senior and not is_junior:
-        s = min(10.0, s + 2.0)
-    return round(s, 2)
-
-
-# ============================================================
-# Geographic scoring — home-based, Paris-accessibility calibrated
-# ============================================================
-# Default calibration: user lives in Northern France (Hauts-de-France /
-# Picardie zone), can commute to Paris a few days a week but full-remote
-# is preferred. Adapt the regex below to your own "target hub" (e.g.
-# Lyon, Geneva, Luxembourg) and tweak the ladder in compute_geo_score().
+# La grille ci-dessous est calibrée pour quelqu'un qui considère Paris/IDF comme
+# "accessible". Adapte _PARIS_RE et compute_geo_score() à ta propre situation
+# géographique (ville d'origine, distance acceptable, etc.).
 
 # Paris / Île-de-France location patterns (dept numbers, major cities)
 _PARIS_RE = re.compile(
@@ -221,10 +164,7 @@ def compute_geo_score(
     location: Optional[str],
     description: Optional[str] = None,
 ) -> float:
-    """Geographic accessibility score (0-10) from the user's home location.
-
-    Default calibration assumes the user lives outside Paris but within
-    commute range, and prefers remote-heavy arrangements.
+    """Geographic accessibility score (0-10) from your home location (calibrate in compute_geo_score).
 
     Priority ladder (descending):
         full_remote (10) > hybrid high-ratio (9) > hybrid Paris (8) >
@@ -333,23 +273,24 @@ def compute_salary_score(
 # Freshness scoring
 # ============================================================
 
-def compute_freshness_score(date_posted: Optional[date]) -> float:  # type: ignore[type-arg]
-    """Score 0-10 with temporal decay from today.
+def compute_freshness_score(date_posted: Optional[date | str]) -> float:
+    """Score 0-10 par décroissance temporelle depuis aujourd'hui.
 
-    Returns 5.0 (neutral) when the posting date is unknown.
+    Retourne 5.0 (neutre) si la date de publication est inconnue.
+    Accepte aussi une date ISO sous forme de string (certains connecteurs en passent).
     """
     if date_posted is None:
         return 5.0
 
-    # Accept ISO string as well (connectors sometimes pass strings)
+    # Tolérance string : convertit "2026-04-21" → date
     if isinstance(date_posted, str):
         try:
             date_posted = date.fromisoformat(date_posted)
         except (ValueError, AttributeError):
             return 5.0
 
-    age_days = (date.today() - date_posted).days  # type: ignore[operator]
-    if age_days < 0:    return 10.0  # future date (timezone artifact) → brand new
+    age_days = (date.today() - date_posted).days
+    if age_days < 0:    return 10.0  # date future (artefact TZ) → considérée comme neuve
     if age_days <= 2:   return 10.0
     if age_days <= 6:   return 9.0
     if age_days <= 13:  return 7.5
@@ -364,7 +305,7 @@ def compute_freshness_score(date_posted: Optional[date]) -> float:  # type: igno
 
 # Must sum to 1.0.
 _W_CONTENT:     float = 0.30   # Claude: role relevance + company quality + description richness
-_W_GEO:         float = 0.30   # Geographic accessibility from user's home location
+_W_GEO:         float = 0.30   # Geographic accessibility from your home location
 _W_SALARY:      float = 0.20   # Salary competitiveness (annualised EUR)
 _W_FRESHNESS:   float = 0.15   # Posting freshness (temporal decay)
 _W_COMPETITION: float = 0.05   # Competition level (defaults to neutral 5.0)

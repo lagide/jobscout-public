@@ -18,6 +18,8 @@ from urllib.parse import urlencode
 import httpx
 
 from .base import BaseConnector, ConnectorResult, JobRecord
+# Note FR : BeautifulSoup a été retiré (jamais utilisé — le parsing va soit
+# vers l'API JSON interne /api/v1/jobs, soit vers un fallback re.findall sur le HTML).
 
 logger = logging.getLogger(__name__)
 

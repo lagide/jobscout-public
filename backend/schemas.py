@@ -38,9 +38,13 @@ class SearchRequest(BaseModel):
     location: Optional[str] = None
     country: Optional[str] = None
 
-    sites: list[Platform] = ["linkedin", "indeed", "glassdoor", "remotive"]
+    # NOTE: 3 sources retirees (anti-bot/login wall - non recuperables sans proxy residentiel ou compte authentifie):
+    #   - glassdoor : Datadome 403
+    #   - himalayas : Cloudflare challenge (__cf_chl)
+    #   - apec     : login wall obligatoire depuis APEC site update
+    sites: list[Platform] = ["linkedin", "indeed", "remotive", "francetravail", "freework", "greenhouse", "workday"]
     results_per_term: int = Field(default=20, ge=1, le=100)
-    hours_old: int = Field(default=168, ge=1, description="Only jobs posted within N hours.")
+    hours_old: int = Field(default=48, ge=1, description="Only jobs posted within N hours.")
     score_new_jobs: bool = True
 
 
@@ -49,6 +53,7 @@ class SearchResponse(BaseModel):
     new: int
     duplicates: int
     merged_sources: int = 0  # Same-content hash, new platform → merged into existing row
+    blacklisted: int = 0     # Offres ignorées car titre matche la blacklist (sales, alternance, technicien…)
     errors: list[str] = []
     log_id: Optional[int] = None
 
@@ -127,6 +132,17 @@ class ArchiveUpdate(BaseModel):
     archived: bool
 
 
+class BulkActionRequest(BaseModel):
+    """POST /jobs/bulk body — applique une action sur N offres en un appel."""
+    action: Literal["delete", "archive", "unarchive", "pipeline_in", "pipeline_out"]
+    ids: list[int] = Field(min_length=1, max_length=500)
+
+
+class BulkActionResponse(BaseModel):
+    affected: int
+    skipped: int = 0  # ids inconnus / protégés
+
+
 class JobsListResponse(BaseModel):
     total: int
     items: list[JobOut]
@@ -156,6 +172,7 @@ class ScrapeLogOut(BaseModel):
     new_jobs: int
     duplicates: int
     merged_sources: int
+    blacklisted: int = 0
     errors: list[str] = []
     fatal_error: Optional[str]
     sites: list[str] = []

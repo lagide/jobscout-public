@@ -1,12 +1,12 @@
-"""SQLAlchemy ORM models.
+"""Modèles ORM SQLAlchemy.
 
-Tables:
-    jobs         — one row per distinct job (deduplicated by content_hash across sources).
-    scrape_logs  — audit trail of scrape runs (started_at, counts, errors).
+Tables :
+    jobs         — une ligne par offre distincte (dédoublonnée par content_hash entre sources).
+    scrape_logs  — historique des runs de scrape (started_at, compteurs, erreurs).
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Optional
 
 from sqlalchemy import (
@@ -23,6 +23,11 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column
 
 from database import Base
+
+
+def _utcnow_naive() -> datetime:
+    """Default factory pour les colonnes DateTime — évite datetime.utcnow() deprecated."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class Job(Base):
@@ -50,7 +55,7 @@ class Job(Base):
     job_type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
     date_posted: Mapped[Optional[date]] = mapped_column(Date, index=True, nullable=True)
-    scraped_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    scraped_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow_naive, index=True)
 
     # Claude-computed relevance (populated asynchronously post-insertion)
     relevance_score: Mapped[Optional[float]] = mapped_column(Float, index=True, nullable=True)
@@ -127,7 +132,7 @@ class ScrapeLog(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     started_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, index=True
+        DateTime, default=_utcnow_naive, index=True
     )
     ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
@@ -140,7 +145,8 @@ class ScrapeLog(Base):
     scraped: Mapped[int] = mapped_column(Integer, default=0)
     new_jobs: Mapped[int] = mapped_column(Integer, default=0)
     duplicates: Mapped[int] = mapped_column(Integer, default=0)
-    merged_sources: Mapped[int] = mapped_column(Integer, default=0)  # same-content, new platform
+    merged_sources: Mapped[int] = mapped_column(Integer, default=0)  # même contenu, nouvelle plateforme
+    blacklisted: Mapped[int] = mapped_column(Integer, default=0)  # offres skippées par la blacklist titre
 
     # JSON list of human-readable error strings (from individual source failures).
     errors: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

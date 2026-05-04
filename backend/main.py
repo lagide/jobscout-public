@@ -1,23 +1,26 @@
-"""FastAPI entry point — endpoints, lifespan-managed scheduler, CORS for Streamlit."""
+"""Point d'entrée FastAPI — endpoints, scheduler géré par lifespan, CORS pour Streamlit."""
 from __future__ import annotations
 
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from sqlalchemy import delete as sqla_delete
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import and_, desc, func, or_
 
-import notifier
 from constants import GEO_PROFILES
 from database import get_session, init_db
 from models import Job, ScrapeLog
 from schemas import (
     ApplicationStatusUpdate,
     ArchiveUpdate,
+    BulkActionRequest,
+    BulkActionResponse,
     GeoProfileOut,
     JobOut,
     JobsListResponse,
@@ -59,18 +62,36 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# CORS — par défaut ouvert seulement aux origines listées dans ALLOWED_ORIGINS
+# (séparées par virgule). Mettre "*" pour autoriser tout — déconseillé car cette
+# API n'a pas d'authentification et expose /search, /rescore qui peuvent générer
+# des coûts (OpenRouter) ou modifier l'état.
+_DEFAULT_ORIGINS = "http://localhost:8501"
+_ALLOWED_ORIGINS = [
+    o.strip() for o in os.getenv("ALLOWED_ORIGINS", _DEFAULT_ORIGINS).split(",") if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_ALLOWED_ORIGINS if _ALLOWED_ORIGINS != ["*"] else ["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "Authorization"],
 )
+
+
+def _utcnow() -> datetime:
+    """Wrapper unique : datetime.utcnow() est deprecated en Python 3.12+."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # ---------- Helpers ----------
 
 def _job_to_out(job: Job) -> JobOut:
-    """Serialize a Job row, decoding the sources JSON."""
+    """Sérialise une ligne Job pour l'API, en décodant le JSON `sources`.
+
+    Tolère un JSON corrompu en silence (champ optionnel — pas critique de planter
+    la liste pour une ligne mal formée).
+    """
     sources_list: list[JobSourceEntry] = []
     if job.sources:
         try:
@@ -79,6 +100,7 @@ def _job_to_out(job: Job) -> JobOut:
                 try:
                     sources_list.append(JobSourceEntry(**entry))
                 except Exception:
+                    # Une entrée mal formée → on ignore, on n'échoue pas tout le serialize
                     pass
         except (TypeError, ValueError):
             pass
@@ -144,6 +166,7 @@ def _log_to_out(log: ScrapeLog) -> ScrapeLogOut:
         new_jobs=log.new_jobs,
         duplicates=log.duplicates,
         merged_sources=log.merged_sources,
+        blacklisted=getattr(log, "blacklisted", 0) or 0,
         errors=errors,
         fatal_error=log.fatal_error,
         sites=sites,
@@ -155,7 +178,38 @@ def _log_to_out(log: ScrapeLog) -> ScrapeLogOut:
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "time": datetime.utcnow().isoformat()}
+    return {"status": "ok", "time": _utcnow().isoformat()}
+
+@app.get("/health/db-size")
+def health_db_size() -> dict:
+    """Return DB file size + row counts for monitoring retention growth."""
+    db_path = "/data/jobs.db"
+    size_bytes = os.path.getsize(db_path) if os.path.exists(db_path) else 0
+    wal_path = db_path + "-wal"
+    shm_path = db_path + "-shm"
+    wal_bytes = os.path.getsize(wal_path) if os.path.exists(wal_path) else 0
+    shm_bytes = os.path.getsize(shm_path) if os.path.exists(shm_path) else 0
+    with get_session() as session:
+        jobs_total = session.query(func.count(Job.id)).scalar() or 0
+        jobs_archived = session.query(func.count(Job.id)).filter(
+            Job.archived == True  # noqa: E712
+        ).scalar() or 0
+        jobs_applied = session.query(func.count(Job.id)).filter(
+            Job.application_status.isnot(None)
+        ).scalar() or 0
+        logs_total = session.query(func.count(ScrapeLog.id)).scalar() or 0
+    return {
+        "db_path": db_path,
+        "db_bytes": size_bytes,
+        "db_mb": round(size_bytes / 1024 / 1024, 2),
+        "wal_bytes": wal_bytes,
+        "shm_bytes": shm_bytes,
+        "total_bytes": size_bytes + wal_bytes + shm_bytes,
+        "jobs_total": jobs_total,
+        "jobs_archived": jobs_archived,
+        "jobs_applied": jobs_applied,
+        "scrape_logs_total": logs_total,
+    }
 
 
 @app.get("/profiles", response_model=list[GeoProfileOut])
@@ -203,6 +257,11 @@ def list_jobs(
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     order_by: str = Query("relevance", pattern="^(relevance|date|scraped)$"),
+    light: bool = Query(
+        False,
+        description="Si true : payload allégé (description + sources vidées) — utile pour "
+                    "les vues tableaux qui n'en ont pas besoin. Réduit le poids ~80%.",
+    ),
 ) -> JobsListResponse:
     """Paginated job list with filters."""
     with get_session() as s:
@@ -261,6 +320,14 @@ def list_jobs(
         jobs = q.offset(offset).limit(limit).all()
         items = [_job_to_out(j) for j in jobs]
 
+    # Mode light : on vide les champs lourds (description + sources) pour
+    # alléger drastiquement le payload (~80% de réduction sur 200 lignes).
+    # Utilisé par la page Triage qui n'affiche que des champs synthétiques.
+    if light:
+        for it in items:
+            it.description = None
+            it.sources = []
+
     return JobsListResponse(total=total, items=items)
 
 
@@ -290,20 +357,28 @@ async def rescore(
     """
     if force:
         with get_session() as s:
-            total = s.query(Job.id).count()
-            s.query(Job).update({
-                "relevance_score": None,
-                "base_score": None,
-                "score_geo": None,
-                "score_salary": None,
-                "score_freshness": None,
-                "relevance_reasoning": None,
-            })
+            # COUNT direct (plus rapide que query(Job.id).count() qui charge la PK)
+            total = s.query(func.count(Job.id)).scalar() or 0
+            # synchronize_session=False : nécessaire pour bulk update sur SQLite
+            # (évite que SQLAlchemy tente d'expirer chaque objet ORM en cache).
+            s.query(Job).update(
+                {
+                    "relevance_score": None,
+                    "base_score": None,
+                    "score_geo": None,
+                    "score_salary": None,
+                    "score_freshness": None,
+                    "relevance_reasoning": None,
+                },
+                synchronize_session=False,
+            )
         background.add_task(rescore_all_force)
         return {"pending": total}
     else:
         with get_session() as s:
-            pending = s.query(Job.id).filter(Job.relevance_score.is_(None)).count()
+            pending = s.query(func.count(Job.id)).filter(
+                Job.relevance_score.is_(None)
+            ).scalar() or 0
         background.add_task(rescore_all_missing)
         return {"pending": pending}
 
@@ -368,7 +443,7 @@ def set_application_status(job_id: int, body: ApplicationStatusUpdate) -> JobOut
             raise HTTPException(404, f"Job {job_id} not found")
         job.application_status = body.status
         if body.status == "applied" and job.applied_date is None:
-            job.applied_date = datetime.utcnow().date()
+            job.applied_date = _utcnow().date()
         if body.status == "closed":
             job.archived = True
         if body.status is None:
@@ -389,6 +464,74 @@ def set_notes(job_id: int, body: NotesUpdate) -> JobOut:
         return _job_to_out(s.get(Job, job_id))
 
 
+@app.delete("/jobs/{job_id}")
+def delete_job(job_id: int) -> dict[str, int]:
+    """Suppression définitive d'une offre (irréversible)."""
+    with get_session() as s:
+        job = s.get(Job, job_id)
+        if not job:
+            raise HTTPException(404, f"Job {job_id} not found")
+        s.delete(job)
+    return {"deleted": job_id}
+
+
+@app.post("/jobs/bulk", response_model=BulkActionResponse)
+def bulk_jobs(req: BulkActionRequest) -> BulkActionResponse:
+    """Actions de masse sur une liste d'IDs.
+
+    Actions disponibles :
+        - delete         : suppression définitive
+        - archive        : archived = True
+        - unarchive      : archived = False
+        - pipeline_in    : application_status = "to_study" si vide
+        - pipeline_out   : application_status = None
+    """
+    if not req.ids:
+        return BulkActionResponse(affected=0, skipped=0)
+
+    with get_session() as s:
+        # On compte d'abord ceux qui existent vraiment
+        existing_ids = {
+            jid for (jid,) in s.query(Job.id).filter(Job.id.in_(req.ids)).all()
+        }
+        skipped = len(req.ids) - len(existing_ids)
+
+        if not existing_ids:
+            return BulkActionResponse(affected=0, skipped=skipped)
+
+        if req.action == "delete":
+            stmt = sqla_delete(Job).where(Job.id.in_(existing_ids))
+            res = s.execute(stmt)
+            affected = res.rowcount or 0
+        elif req.action == "archive":
+            res = s.query(Job).filter(Job.id.in_(existing_ids)).update(
+                {"archived": True}, synchronize_session=False,
+            )
+            affected = res or 0
+        elif req.action == "unarchive":
+            res = s.query(Job).filter(Job.id.in_(existing_ids)).update(
+                {"archived": False}, synchronize_session=False,
+            )
+            affected = res or 0
+        elif req.action == "pipeline_in":
+            # Ajoute uniquement les offres pas déjà dans le pipeline
+            res = s.query(Job).filter(
+                Job.id.in_(existing_ids),
+                Job.application_status.is_(None),
+            ).update({"application_status": "to_study"}, synchronize_session=False)
+            affected = res or 0
+        elif req.action == "pipeline_out":
+            res = s.query(Job).filter(Job.id.in_(existing_ids)).update(
+                {"application_status": None, "applied_date": None},
+                synchronize_session=False,
+            )
+            affected = res or 0
+        else:
+            raise HTTPException(400, f"Unknown action: {req.action}")
+
+    return BulkActionResponse(affected=affected, skipped=skipped)
+
+
 @app.post("/jobs/{job_id}/archive", response_model=JobOut)
 def set_archived(job_id: int, body: ArchiveUpdate) -> JobOut:
     with get_session() as s:
@@ -398,25 +541,6 @@ def set_archived(job_id: int, body: ArchiveUpdate) -> JobOut:
         job.archived = body.archived
     with get_session() as s:
         return _job_to_out(s.get(Job, job_id))
-
-
-@app.post("/telegram/test")
-async def telegram_test() -> dict[str, object]:
-    """Send a ping to the configured Telegram bot. Returns configuration + send status."""
-    if not notifier.is_configured():
-        raise HTTPException(
-            400,
-            "Telegram is not configured. Set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in .env.",
-        )
-    ok = await notifier.send_markdown(
-        f"✅ *JobScout* — ping de test\n"
-        f"_Horodatage_: {datetime.utcnow().isoformat()}Z"
-    )
-    return {
-        "configured": True,
-        "min_score": notifier.get_min_score(),
-        "sent": ok,
-    }
 
 
 @app.get("/logs", response_model=ScrapeLogsResponse)
