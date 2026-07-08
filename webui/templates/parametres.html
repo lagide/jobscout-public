@@ -1,0 +1,499 @@
+{% extends "base.html" %}
+{% block title %}paramètres{% endblock %}
+{% block content %}
+<div class="phead"><span class="mk">&gt;pds</span><h1>paramètres</h1>
+  <span class="meta">configuration centralisée</span></div>
+<div class="prompt">clés API, scoring, sources, blacklist, scheduler — appliqués à chaud, sans rebuild</div>
+
+{% if backend_error %}<div class="alert alert--err">backend injoignable : {{ backend_error }}</div>{% endif %}
+
+{% if cfg %}
+{% set s = cfg.settings %}
+<div id="set-fb"></div>
+
+{% macro secret_row(sec) %}
+<div style="border-bottom:1px solid rgba(30,48,68,.4);padding:10px 0">
+  <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+    <span style="width:250px;flex:none">
+      {{ sec.label }}<br>
+      <span style="font-size:.68rem;color:var(--dim)">{{ sec.name }}
+        {% if sec.help %} · <a href="{{ sec.help }}" target="_blank" style="font-size:.68rem">obtenir ↗</a>{% endif %}
+      </span>
+    </span>
+    {% if sec.configured %}
+    <span class="tag tag--green">configurée{{ ' ' + sec.hint if sec.hint }}</span>
+    <span class="tag">source : {{ sec.source }}</span>
+    {% else %}
+    <span class="tag tag--yellow">absente</span>
+    {% endif %}
+    <button style="margin-left:auto"
+      hx-post="/actions/settings/secret-test" hx-target="#fb-{{ sec.name }}"
+      hx-vals='{"name": "{{ sec.name }}"}'>
+      ▸ tester la clé configurée <span class="htmx-indicator">…</span></button>
+  </div>
+  <form hx-post="/actions/settings/secret" hx-target="#fb-{{ sec.name }}"
+        hx-confirm="Remplacer la clé {{ sec.name }} ? Elle sera immédiatement utilisée par l'application (un test de connexion sera lancé après l'enregistrement)."
+        style="display:flex;gap:10px;align-items:center;margin-top:8px;flex-wrap:wrap">
+    <input type="hidden" name="name" value="{{ sec.name }}">
+    <input type="password" name="value" placeholder="nouvelle valeur (vide = retirer la surcharge, retour au .env)"
+           autocomplete="new-password" style="flex:1;min-width:230px">
+    <button type="button"
+      hx-post="/actions/settings/secret-test" hx-target="#fb-{{ sec.name }}"
+      hx-include="closest form">tester cette valeur sans l'enregistrer <span class="htmx-indicator">…</span></button>
+    <button type="submit" class="primary">enregistrer + test <span class="htmx-indicator">…</span></button>
+  </form>
+  <div id="fb-{{ sec.name }}"></div>
+</div>
+{% endmacro %}
+
+<!-- ═══════════════ 1. Clés API ═══════════════ -->
+<div class="grid2">
+  <div class="card"><div class="card__h"><div class="dots"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i></div>
+    <span class="card__t">api_keys — scoring LLM · valeurs jamais affichées</span></div>
+    <div class="card__b">
+      {% for sec in cfg.secrets if sec.group == 'llm' %}{{ secret_row(sec) }}{% endfor %}
+      <div style="font-size:.7rem;color:var(--dim);margin-top:8px">
+        Groq = provider primaire (gratuit, ~100 k tokens/jour), OpenRouter = fallback.
+        « Tester » appelle réellement l'API du provider (liste des modèles / état du compte),
+        sans consommer de tokens de scoring.
+      </div>
+    </div>
+  </div>
+  <div class="card"><div class="card__h"><div class="dots"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i></div>
+    <span class="card__t">api_keys — sources de scraping</span></div>
+    <div class="card__b">
+      {% for sec in cfg.secrets if sec.group == 'scraping' %}{{ secret_row(sec) }}{% endfor %}
+      <div style="font-size:.7rem;color:var(--dim);margin-top:8px">
+        France Travail : le test valide la PAIRE id + secret par une vraie demande de
+        token OAuth2. En cas de refus persistant, régénérer les credentials sur
+        francetravail.io (piège connu : ils expirent silencieusement).
+        Une clé enregistrée ici vit dans <code>config/secrets.json</code> (chmod 600)
+        et prime sur le <code>.env</code> ; champ vide = retour au <code>.env</code>.
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="grid2">
+  <!-- ═══════════════ 2. Poids de la formule ═══════════════ -->
+  <div class="card"><div class="card__h"><div class="dots"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i></div>
+    <span class="card__t">scoring_formula.weights — somme = 1.00</span></div>
+    <div class="card__b">
+      <form hx-post="/actions/settings/weights" hx-target="#set-fb" id="weights-form">
+        {% for key, label, tip in [
+            ('content', 'Contenu (note LLM)', 'Pertinence du poste pour le profil : rôle, technicité cyber/réseau, séniorité, entreprise, qualité de description. Seul axe noté par le LLM.'),
+            ('geo', 'Géographie', 'Accessibilité depuis l\'origine configurée (config/geo_scope.json), calculée en Python (voir barème ci-dessous).'),
+            ('salary', 'Salaire', 'Salaire annualisé en EUR vs seuils senior (voir barème). 4.0 si non affiché.'),
+            ('freshness', 'Fraîcheur', 'Décroissance temporelle depuis la publication, recalculée chaque nuit.'),
+            ('competition', 'Concurrence', 'Réservé pour un futur signal de concurrence — neutre 5.0 aujourd\'hui.')] %}
+        <div class="kv" title="{{ tip }}"><span class="k">{{ label|upper }} ⓘ</span>
+          <input type="number" name="{{ key }}" value="{{ s.weights[key] }}" class="w-in"
+                 step="0.05" min="0" max="1" style="width:90px;text-align:right"></div>
+        {% endfor %}
+        <div class="kv"><span class="k">SOMME</span><span id="w-sum" class="v">1.00</span></div>
+        <div style="display:flex;gap:10px;margin-top:12px">
+          <button type="submit" class="primary">enregistrer les poids <span class="htmx-indicator">…</span></button>
+        </div>
+      </form>
+      <button style="width:100%;margin-top:10px" hx-post="/actions/settings/recompute" hx-target="#set-fb"
+        hx-confirm="Recalculer le score final de toutes les offres notées avec les poids actuels (sans appel LLM, instantané) ?">
+        ▸ recalculer les scores (sans LLM) <span class="htmx-indicator">…</span></button>
+      <details style="margin-top:12px">
+        <summary style="cursor:pointer;font-size:.72rem;color:var(--txt2)">▸ comment chaque axe est noté (barèmes)</summary>
+        <div style="font-size:.72rem;color:var(--txt2);line-height:1.7;padding:8px 4px">
+          <b style="color:var(--txt)">Contenu (LLM, 0-10)</b> — sous-grille du prompt : fit profil ×0.45 +
+          technicité cyber/réseau ×0.25 + posture senior/client ×0.15 + entreprise ×0.10 + description ×0.05,
+          bonus (éditeur cyber +1, ZTNA/firewall +1…) et malus (quota commercial −2…).
+          Disqualification immédiate (0-2) : stage, dev pur, commercial, non-IT — et un score contenu ≤ 2
+          <b>plafonne le score final à 3.0</b> quel que soit le reste.<br>
+          <b style="color:var(--txt)">Géographie (Python, 0-10)</b> — full remote <b>10</b> · hybride ≥4j/5 remote <b>9</b> ·
+          hybride Paris <b>8</b> · hybride 3j/5 hors Paris <b>5.5</b> · onsite Paris <b>5</b> ·
+          mode inconnu Paris <b>4.5</b> · onsite province <b>1</b>.<br>
+          <b style="color:var(--txt)">Salaire (Python, 0-10)</b> — annualisé EUR (médiane si fourchette) :
+          &lt;40 k <b>1</b> · &lt;50 k <b>3</b> · &lt;60 k <b>5</b> · &lt;70 k <b>6.5</b> · &lt;80 k <b>7.5</b> ·
+          &lt;95 k <b>8.5</b> · &lt;115 k <b>9</b> · au-delà <b>10</b> · non affiché <b>4</b>.<br>
+          <b style="color:var(--txt)">Fraîcheur (Python, 0-10)</b> — ≤2 j <b>10</b> · ≤6 j <b>9</b> · ≤13 j <b>7.5</b> ·
+          ≤29 j <b>5.5</b> · ≤59 j <b>3</b> · au-delà <b>1</b>. Sans date de publication : date de découverte.<br>
+          Axes manquants → neutre 5.0. Après un changement de poids, « recalculer » suffit
+          (les composantes sont déjà stockées) — aucun appel LLM.
+        </div>
+      </details>
+    </div>
+  </div>
+
+  <!-- ═══════════════ 3. Providers LLM ═══════════════ -->
+  <div class="card"><div class="card__h"><div class="dots"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i></div>
+    <span class="card__t">llm_providers.conf — n° 1 = primaire, suivants = fallbacks</span></div>
+    <div class="card__b">
+      <form hx-post="/actions/settings/llm" hx-target="#set-fb">
+        {% set key_of = {'groq': 'GROQ_API_KEY', 'openrouter': 'OPENROUTER_API_KEY',
+                         'anthropic': 'ANTHROPIC_API_KEY', 'openai': 'OPENAI_API_KEY',
+                         'google': 'GEMINI_API_KEY'} %}
+        {% for p in s.llm.providers %}
+        {% set sec = cfg.secrets | selectattr('name', 'equalto', key_of.get(p.name, '')) | first %}
+        <div style="border-bottom:1px solid rgba(30,48,68,.4);padding:8px 0">
+          <input type="hidden" name="provider_name" value="{{ p.name }}">
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            <input type="number" name="order_{{ p.name }}" value="{{ loop.index }}"
+                   min="1" max="9" title="ordre de priorité" style="width:52px;text-align:center">
+            <label style="display:flex;gap:8px;align-items:center;cursor:pointer;width:130px;flex:none">
+              <input type="checkbox" name="enabled_{{ p.name }}" {% if p.enabled %}checked{% endif %}>
+              <span style="color:var(--txt)">{{ p.name }}</span>
+            </label>
+            {% if sec and sec.configured %}<span class="tag tag--green">clé OK</span>
+            {% else %}<span class="tag tag--yellow" title="renseigner {{ key_of.get(p.name) }} dans les cartes clés API ci-dessus">clé absente</span>{% endif %}
+            <input type="text" name="model_{{ p.name }}" value="{{ p.model }}"
+                   placeholder="modèle" style="flex:1;min-width:210px">
+            <span style="font-size:.66rem;color:var(--dim)">RPM</span>
+            <input type="number" name="rpm_{{ p.name }}" value="{{ p.rpm }}" min="1" max="300"
+                   style="width:70px;text-align:right">
+          </div>
+        </div>
+        {% endfor %}
+        <div class="kv" style="margin-top:10px"><span class="k">CONCURRENCE</span>
+          <input type="number" name="concurrency" value="{{ s.llm.concurrency }}" min="1" max="8" style="width:90px;text-align:right"></div>
+        <div class="kv"><span class="k">RETRIES / PROVIDER</span>
+          <input type="number" name="retries" value="{{ s.llm.retries }}" min="1" max="6" style="width:90px;text-align:right"></div>
+        <div class="kv"><span class="k">DESCRIPTION MAX (CHARS)</span>
+          <input type="number" name="max_description_chars" value="{{ s.llm.max_description_chars }}" min="500" max="8000" step="100" style="width:90px;text-align:right"></div>
+        <div class="kv"><span class="k">TEMPÉRATURE</span>
+          <input type="number" name="temperature" value="{{ s.llm.temperature }}" min="0" max="1" step="0.1" style="width:90px;text-align:right"></div>
+        <div style="margin-top:12px">
+          <button type="submit" class="primary">enregistrer les providers <span class="htmx-indicator">…</span></button>
+        </div>
+      </form>
+      <div style="font-size:.7rem;color:var(--dim);margin-top:8px">
+        Un provider n'est utilisé que s'il est <b>activé ET sa clé configurée</b>. Tous passent
+        par la même API OpenAI-compatible (Anthropic et Google via leurs endpoints de
+        compatibilité officiels). Gratuits : groq (~100 k tokens/jour ≈ 30 offres) et
+        openrouter (free, souvent saturé). Payants (échelle scoring ≈ 3 200 tokens/offre) :
+        anthropic <code>claude-haiku-4-5</code> ≈ 0,4 ¢/offre · openai <code>gpt-4o-mini</code>
+        ≈ 0,05 ¢/offre · google <code>gemini-2.5-flash</code> ≈ 0,1 ¢/offre.
+        Appliqué au prochain appel de scoring, sans restart.
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════ 4. Prompt de scoring + banc d'essai ═══════════════ -->
+<div class="grid2">
+  <div class="card"><div class="card__h"><div class="dots"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i></div>
+    <span class="card__t">scoring_prompt.txt — <span id="p-count">{{ prompt.chars if prompt else '?' }}</span> chars ·
+      {{ 'défaut' if prompt and prompt.is_default else 'personnalisé' }}</span></div>
+    <div class="card__b">
+      <form hx-post="/actions/settings/prompt" hx-target="#set-fb">
+        <textarea name="text" id="prompt-ta" rows="24" style="width:100%;line-height:1.5"
+          spellcheck="false">{{ prompt.text if prompt }}</textarea>
+        <div style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap">
+          <button type="submit" class="primary">enregistrer le prompt <span class="htmx-indicator">…</span></button>
+          <button type="button" id="copy-prompt">⧉ copier dans le presse-papier</button>
+          <button type="button" hx-post="/actions/settings/prompt-reset" hx-target="#set-fb"
+            hx-confirm="Restaurer le prompt par défaut (le prompt actuel sera écrasé) ?">
+            restaurer le défaut</button>
+        </div>
+      </form>
+      <div style="font-size:.7rem;color:var(--dim);margin-top:8px">
+        Le prompt ne doit noter QUE le contenu — géo, salaire et fraîcheur sont calculés en
+        Python. Valide toute modification sur le banc d'essai ci-contre AVANT d'enregistrer ;
+        puis « rescore TOUT (force) » (page Système) pour re-noter le stock existant.
+      </div>
+    </div>
+  </div>
+
+  <div class="card"><div class="card__h"><div class="dots"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i></div>
+    <span class="card__t">prompt_bench — tester sur une offre fictive</span></div>
+    <div class="card__b">
+      <form hx-post="/actions/settings/prompt-test" hx-target="#bench-out"
+            hx-include="#prompt-ta">
+        <div class="kv"><span class="k">OFFRE D'ESSAI</span>
+          <select id="bench-sample" style="width:100%;max-width:340px">
+            <option value="">— saisir manuellement —</option>
+            {% for smp in samples %}
+            <option value="{{ loop.index0 }}">{{ smp.label }}</option>
+            {% endfor %}
+          </select></div>
+        <div class="kv"><span class="k">TITRE</span>
+          <input type="text" name="title" id="bench-title" style="width:100%;max-width:340px"></div>
+        <div class="kv"><span class="k">ENTREPRISE</span>
+          <input type="text" name="company" id="bench-company" style="width:100%;max-width:340px"></div>
+        <div class="kv"><span class="k">TYPE / PLATEFORME</span>
+          <span><input type="text" name="job_type" id="bench-jobtype" placeholder="fulltime" style="width:110px">
+          <input type="text" name="platform" id="bench-platform" placeholder="linkedin" style="width:110px"></span></div>
+        <div style="margin:8px 0 4px;font-size:.66rem;color:var(--dim);text-transform:uppercase;letter-spacing:1px">description</div>
+        <textarea name="description" id="bench-desc" rows="7" style="width:100%;line-height:1.5" spellcheck="false"></textarea>
+        <input type="hidden" name="expected" id="bench-expected" value="">
+        <label style="display:flex;gap:8px;align-items:center;margin:10px 0;font-size:.76rem;color:var(--txt2)">
+          <input type="checkbox" name="use_active">
+          tester avec le prompt ENREGISTRÉ (au lieu du contenu de l'éditeur ci-contre)
+        </label>
+        <button type="submit" class="primary" style="width:100%">
+          ▸ noter cette offre (1 appel LLM réel, ~3 200 tokens) <span class="htmx-indicator">…</span></button>
+      </form>
+      <div id="bench-out" style="margin-top:10px"></div>
+      <div style="font-size:.7rem;color:var(--dim);margin-top:8px">
+        Les 4 offres d'essai sont calibrées : le cas parfait doit sortir 8-10, les deux
+        pièges (sécurité incendie, commercial IT) 0-2, le Responsable SI 5-8. Un prompt
+        candidat qui inverse ces attentes est cassé — le verdict s'affiche automatiquement.
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="grid2">
+  <!-- ═══════════════ 5. Sources ═══════════════ -->
+  <div class="card"><div class="card__h"><div class="dots"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i></div>
+    <span class="card__t">sources.list — {{ cfg.sites|selectattr('selected')|list|length }} active(s) sur {{ cfg.sites|length }}</span></div>
+    <div class="card__b">
+      <form hx-post="/actions/settings/search" hx-target="#set-fb">
+        {% for site in cfg.sites %}
+        <div style="border-bottom:1px solid rgba(30,48,68,.4);padding:7px 0">
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            <label style="display:flex;gap:10px;align-items:center;cursor:pointer;flex:1;min-width:230px">
+              <input type="checkbox" name="sites" value="{{ site.name }}" {% if site.selected %}checked{% endif %}>
+              <span style="width:150px;flex:none;color:var(--txt)">{{ site.name }}</span>
+              <span class="tag">{{ 'jobspy' if site.kind == 'jobspy' else ('structuré' if site.structured else 'connecteur') }}</span>
+              {% if not site.available %}<span class="tag tag--yellow">config manquante</span>{% endif %}
+            </label>
+            <button type="button" hx-post="/actions/settings/source-test/{{ site.name }}"
+                    hx-target="#src-fb-{{ site.name }}" {% if not site.available %}disabled{% endif %}>
+              ▸ tester <span class="htmx-indicator">…</span></button>
+          </div>
+          <div style="font-size:.68rem;color:var(--dim);padding-left:28px;line-height:1.5">
+            {{ site.desc }}{% if site.note %} — <i>{{ site.note }}</i>{% endif %}
+            {% if site.requires %} · requiert : {{ site.requires|join(', ') }}{% endif %}
+          </div>
+          <div id="src-fb-{{ site.name }}" style="padding-left:28px"></div>
+        </div>
+        {% endfor %}
+        <div class="kv" style="margin-top:10px"><span class="k">RÉSULTATS / TERME</span>
+          <input type="number" name="results_per_term" value="{{ s.search.results_per_term }}" min="1" max="100" style="width:90px;text-align:right"></div>
+        <div class="kv"><span class="k">FENÊTRE (HEURES)</span>
+          <input type="number" name="hours_old" value="{{ s.search.hours_old }}" min="1" max="720" style="width:90px;text-align:right"></div>
+
+        <div style="margin:14px 0 4px;font-size:.66rem;color:var(--dim);text-transform:uppercase;letter-spacing:1px">
+          localisation — sources jobspy (linkedin, indeed, google…)</div>
+        <div class="kv" title="Localité passée aux requêtes JobSpy : ville, région ou pays (ex. France, Paris, Belgique, Reims).">
+          <span class="k">ZONE DE RECHERCHE ⓘ</span>
+          <input type="text" name="location" value="{{ s.search.location }}" style="width:200px"></div>
+        <div class="kv" title="Pays au sens Indeed/Glassdoor — doit correspondre au domaine national utilisé (ex. France, Belgium, Switzerland, Canada).">
+          <span class="k">PAYS (INDEED/GLASSDOOR) ⓘ</span>
+          <input type="text" name="country" value="{{ s.search.country }}" style="width:200px"></div>
+        <div class="kv" title="Filtre appliqué à l'INGESTION pour TOUTES les sources : full remote = France entière ; hybride/présentiel = IDF ou le périmètre défini dans config/geo_scope.json (origine + rayon). À décocher si la zone de recherche sort de ce périmètre, sinon tout sera rejeté.">
+          <span class="k">FILTRE GÉO À L'INGESTION ⓘ</span>
+          <input type="checkbox" name="geo_filter_enabled" {% if s.search.geo_filter_enabled %}checked{% endif %}></div>
+
+        <div style="margin-top:12px">
+          <button type="submit" class="primary">enregistrer les sources <span class="htmx-indicator">…</span></button>
+        </div>
+      </form>
+      <div style="font-size:.7rem;color:var(--dim);margin-top:8px">
+        Qui utilise quoi : <b>zone/pays</b> ci-dessus → sources JobSpy uniquement ·
+        <b>France Travail</b> → codes ROME + départements (carte connecteurs ci-contre) ·
+        <b>WTTJ</b> → filtre pays FR côté API · les autres connecteurs sont FR par
+        construction. Le <b>filtre géo à l'ingestion</b> s'applique en dernier, à toutes les sources.
+      </div>
+      <div style="font-size:.7rem;color:var(--dim);margin-top:8px">
+        « Tester » lance une vraie mini-recherche (3 résultats max, 10-90 s) : vérifie
+        credentials, connectivité et anti-bot. Ajouter un nouveau TYPE de source
+        (Lever, Ashby, Stepstone…) reste une évolution de code (connecteur dans
+        <code>backend/connectors/</code>) — en revanche les instances Greenhouse/Workday
+        s'ajoutent ci-contre sans code.
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════ 6. Connecteurs — configuration fine ═══════════════ -->
+  <div class="card"><div class="card__h"><div class="dots"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i></div>
+    <span class="card__t">connectors.conf — filtres structurés & instances</span></div>
+    <div class="card__b">
+      <form hx-post="/actions/settings/connectors" hx-target="#set-fb">
+        <div class="kv" title="Codes métiers ROME interrogés sur France Travail (format X9999, virgules). M1802 support/expertise SI · M1803 direction SI · M1806 conseil/MOA · M1810 production/exploitation. M1805 (dev) exclu volontairement : bruit junior.">
+          <span class="k">CODES ROME (FT) ⓘ</span>
+          <input type="text" name="ft_rome_codes" value="{{ s.connectors.ft_rome_codes|join(', ') }}" style="width:250px"></div>
+        <div class="kv" title="Niveau de qualification France Travail : 9 = cadre (élimine techniciens N1-N2), vide = pas de filtre.">
+          <span class="k">QUALIFICATION FT ⓘ</span>
+          <input type="text" name="ft_qualification" value="{{ s.connectors.ft_qualification }}" maxlength="1" style="width:90px;text-align:right"></div>
+        <div class="kv" title="Départements ciblés pour les requêtes onsite/hybride France Travail (le full remote n'est pas restreint).">
+          <span class="k">DÉPARTEMENTS IDF ⓘ</span>
+          <input type="text" name="idf_departments" value="{{ s.connectors.idf_departments|join(', ') }}" style="width:250px"></div>
+        <div class="kv" title="Connecteurs nécessitant un navigateur Chromium headless — coûteux sur le NAS (1.7 Go RAM). Aucun connecteur actif ne l'exige actuellement.">
+          <span class="k">PLAYWRIGHT ⓘ</span>
+          <input type="checkbox" name="playwright_enabled" {% if s.connectors.playwright_enabled %}checked{% endif %}></div>
+        <div style="margin:12px 0 4px;font-size:.66rem;color:var(--dim);text-transform:uppercase;letter-spacing:1px">
+          boards greenhouse (un slug par ligne — ex. <code>sentinelone</code>)</div>
+        <textarea name="greenhouse_boards" rows="4" style="width:100%;line-height:1.6"
+          spellcheck="false" placeholder="slug-entreprise&#10;autre-slug">{{ s.connectors.greenhouse_boards|join('\n') }}</textarea>
+        <div style="margin:12px 0 4px;font-size:.66rem;color:var(--dim);text-transform:uppercase;letter-spacing:1px">
+          tenants workday (un par ligne — format <code>Société|https://societe.wd3.myworkdayjobs.com/…</code>)</div>
+        <textarea name="workday_sites" rows="4" style="width:100%;line-height:1.6"
+          spellcheck="false" placeholder="Société|https://…">{{ s.connectors.workday_sites|join('\n') }}</textarea>
+        <div style="margin-top:12px">
+          <button type="submit" class="primary">enregistrer les connecteurs <span class="htmx-indicator">…</span></button>
+        </div>
+      </form>
+      <div style="font-size:.7rem;color:var(--dim);margin-top:8px">
+        Ajouter un board Greenhouse : repérer le slug dans l'URL carrière
+        (<code>boards.greenhouse.io/&lt;slug&gt;</code>), le coller ici, cocher la source
+        « greenhouse » ci-contre, puis « tester ». Le filtre géo à l'ingestion protège
+        des offres NYC/Tokyo taggées France (correctif 2026-06-03).
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════ 7. Blacklist ═══════════════ -->
+<div class="card"><div class="card__h"><div class="dots"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i></div>
+  <span class="card__t">blacklist.json — {{ blacklist.title_patterns|length if blacklist else '?' }} patterns ·
+    {{ blacklist.companies|length if blacklist else '?' }} entreprises</span></div>
+  <div class="card__b">
+    <form hx-post="/actions/settings/blacklist" hx-target="#set-fb">
+      <div class="grid2">
+        <div>
+          <div class="card__t" style="margin-bottom:6px">patterns titres (regex, un par ligne)</div>
+          <textarea name="title_patterns" rows="14" style="width:100%;line-height:1.6"
+            spellcheck="false">{{ blacklist.title_patterns|join('\n') if blacklist }}</textarea>
+        </div>
+        <div>
+          <div class="card__t" style="margin-bottom:6px">entreprises exclues (une par ligne)</div>
+          <textarea name="companies" rows="14" style="width:100%;line-height:1.6"
+            spellcheck="false">{{ blacklist.companies|join('\n') if blacklist }}</textarea>
+          <div class="card__t" style="margin:12px 0 6px">abréviations (sensibles à la casse, virgules)</div>
+          <input type="text" name="title_abbr" style="width:100%"
+            value="{{ blacklist.title_abbr|join(', ') if blacklist }}">
+        </div>
+      </div>
+      <div style="margin-top:12px">
+        <button type="submit" class="primary">enregistrer la blacklist <span class="htmx-indicator">…</span></button>
+      </div>
+    </form>
+    <div style="font-size:.7rem;color:var(--dim);margin-top:8px">
+      Chaque regex est validée avant écriture — une regex invalide bloque l'enregistrement.
+      La purge rétroactive des offres déjà en base tourne chaque nuit (03:00 UTC) ; les offres
+      du pipeline et archivées sont protégées.
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════ 8. Scheduler & rétention + maintenance ═══════════════ -->
+<div class="grid2">
+  <div class="card"><div class="card__h"><div class="dots"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i></div>
+    <span class="card__t">scheduler.conf — prochain scrape :
+      {{ (cfg.next_scrape or 'en pause')[:16]|replace('T', ' ') }}</span></div>
+    <div class="card__b">
+      <form hx-post="/actions/settings/scheduler" hx-target="#set-fb">
+        <div class="kv"><span class="k">SCRAPE AUTOMATIQUE</span>
+          <input type="checkbox" name="scrape_enabled" {% if s.scheduler.scrape_enabled %}checked{% endif %}></div>
+        <div class="kv"><span class="k">INTERVALLE (HEURES)</span>
+          <input type="number" name="refresh_interval_hours" value="{{ s.scheduler.refresh_interval_hours }}" min="1" max="168" style="width:90px;text-align:right"></div>
+        <div class="kv"><span class="k">SCRAPE AU DÉMARRAGE</span>
+          <input type="checkbox" name="run_on_startup" {% if s.scheduler.run_on_startup %}checked{% endif %}></div>
+        <div class="kv"><span class="k">RÉTENTION (JOURS)</span>
+          <input type="number" name="job_retention_days" value="{{ s.scheduler.job_retention_days }}" min="7" max="365" style="width:90px;text-align:right"></div>
+        <div class="kv"><span class="k">PURGE SI NON REVUE (JOURS)</span>
+          <input type="number" name="job_not_seen_days" value="{{ s.scheduler.job_not_seen_days }}" min="3" max="90" style="width:90px;text-align:right"></div>
+        <div class="kv"><span class="k">LOGS DE SCRAPE CONSERVÉS</span>
+          <input type="number" name="scrape_log_keep" value="{{ s.scheduler.scrape_log_keep }}" min="10" max="1000" style="width:90px;text-align:right"></div>
+        <div style="margin-top:12px">
+          <button type="submit" class="primary">enregistrer le scheduler <span class="htmx-indicator">…</span></button>
+        </div>
+      </form>
+      <div style="font-size:.7rem;color:var(--dim);margin-top:8px">
+        Le changement d'intervalle re-planifie le job à chaud. « Purge si non revue » :
+        une offre absente des scrapes pendant N jours est considérée pourvue et supprimée
+        (pipeline et archivées protégés).
+      </div>
+    </div>
+  </div>
+
+  <div class="card"><div class="card__h"><div class="dots"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i></div>
+    <span class="card__t">maintenance.sh</span></div>
+    <div class="card__b">
+      <button style="width:100%;margin-bottom:8px" hx-post="/ops/config-reload" hx-target="#set-fb">
+        ▸ recharger la config depuis les fichiers (volume ./config) <span class="htmx-indicator">…</span></button>
+      <form hx-post="/actions/settings/reset" hx-target="#set-fb"
+            hx-confirm="Réinitialiser la section choisie aux défauts codés + .env ?"
+            style="display:flex;gap:10px;align-items:center">
+        <select name="section" style="flex:1">
+          <option value="weights">poids du scoring</option>
+          <option value="llm">providers LLM</option>
+          <option value="search">sources & termes</option>
+          <option value="connectors">connecteurs</option>
+          <option value="scheduler">scheduler & rétention</option>
+          <option value="">TOUT réinitialiser</option>
+        </select>
+        <button type="submit" class="danger">réinitialiser <span class="htmx-indicator">…</span></button>
+      </form>
+      <div style="font-size:.7rem;color:var(--dim);margin-top:10px">
+        Fichiers concernés : <code>settings.json</code>, <code>secrets.json</code>,
+        <code>blacklist.json</code>, <code>scoring_prompt.txt</code>, <code>geo_scope.json</code>
+        — tous montés depuis <code>./config</code>, éditables aussi à la main puis rechargés ici.
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════ 9. Termes de recherche ═══════════════ -->
+<div class="card"><div class="card__h"><div class="dots"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i></div>
+  <span class="card__t">search_terms.txt — {{ s.search.search_terms|length }} termes · un par ligne</span></div>
+  <div class="card__b">
+    <form hx-post="/actions/settings/terms" hx-target="#set-fb">
+      <textarea name="terms" rows="14" style="width:100%;line-height:1.6"
+        spellcheck="false">{{ s.search.search_terms|join('\n') }}</textarea>
+      <div style="margin-top:10px">
+        <button type="submit" class="primary">enregistrer les termes <span class="htmx-indicator">…</span></button>
+      </div>
+    </form>
+    <div style="font-size:.7rem;color:var(--dim);margin-top:8px">
+      Une requête est émise par terme et par source keyword — chaque ligne a un coût en temps
+      de scrape (~10 s/terme). Les connecteurs structurés (France Travail : codes ROME)
+      ignorent ces termes. Doublons dédupliqués automatiquement à l'enregistrement.
+    </div>
+  </div>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Données des offres d'essai (injectées côté serveur, remplissage côté client).
+const BENCH_SAMPLES = {{ samples|tojson if samples else '[]' }};
+document.getElementById('bench-sample')?.addEventListener('change', (e) => {
+  const smp = BENCH_SAMPLES[parseInt(e.target.value, 10)];
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v || ''; };
+  if (!smp) { ['bench-title','bench-company','bench-jobtype','bench-platform','bench-desc','bench-expected']
+              .forEach(id => set(id, '')); return; }
+  set('bench-title', smp.title); set('bench-company', smp.company);
+  set('bench-jobtype', smp.job_type); set('bench-platform', smp.platform);
+  set('bench-desc', smp.description); set('bench-expected', smp.expected);
+});
+
+// Somme des poids en direct — vert si 1.00, rouge sinon.
+const wForm = document.getElementById('weights-form');
+function refreshSum() {
+  if (!wForm) return;
+  let sum = 0;
+  wForm.querySelectorAll('input.w-in').forEach(i => { sum += parseFloat(i.value) || 0; });
+  const out = document.getElementById('w-sum');
+  out.textContent = sum.toFixed(2);
+  out.style.color = Math.abs(sum - 1.0) < 0.005 ? 'var(--green)' : 'var(--red)';
+}
+wForm?.addEventListener('input', refreshSum);
+refreshSum();
+
+// Copie du prompt dans le presse-papier + compteur de caractères.
+const promptTa = document.getElementById('prompt-ta');
+document.getElementById('copy-prompt')?.addEventListener('click', async (e) => {
+  try {
+    await navigator.clipboard.writeText(promptTa.value);
+    e.target.textContent = '✓ copié';
+  } catch {
+    promptTa.select(); document.execCommand('copy');   // fallback HTTP non sécurisé
+    e.target.textContent = '✓ copié (fallback)';
+  }
+  setTimeout(() => { e.target.textContent = '⧉ copier dans le presse-papier'; }, 2000);
+});
+promptTa?.addEventListener('input', () => {
+  const c = document.getElementById('p-count'); if (c) c.textContent = promptTa.value.length;
+});
+</script>
+{% endblock %}

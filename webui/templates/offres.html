@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}offres{% endblock %}
+{% block content %}
+<div class="phead"><span class="mk">&gt;pds</span><h1>offres</h1>
+  <span class="meta">split view · htmx</span></div>
+<div class="prompt">filtre, clique une offre → détail à droite, sans rechargement</div>
+
+<form class="filters"
+      hx-get="/offres/list" hx-target="#of-list" hx-swap="innerHTML"
+      hx-trigger="submit, change, keyup from:input delay:400ms">
+  <input type="text" name="kw" placeholder="rechercher mots-clés…">
+  <select name="platform">
+    <option value="">toutes plateformes</option>
+    {% for p in PLATFORMS %}<option value="{{ p }}">{{ p }}</option>{% endfor %}
+  </select>
+  <select name="mode">
+    <option value="">tous modes</option>
+    <option value="full_remote">remote</option>
+    <option value="hybrid">hybrid</option>
+    <option value="onsite">onsite</option>
+  </select>
+  <select name="min_base">
+    <option value="0">score min : tous</option>
+    {% for s in [4,5,6,7,8] %}<option value="{{ s }}">contenu ≥ {{ s }}</option>{% endfor %}
+  </select>
+  <span class="htmx-indicator">chargement…</span>
+</form>
+
+<div class="split">
+  <div class="of-list" id="of-list"
+       hx-get="/offres/list" hx-trigger="load" hx-swap="innerHTML">
+    <div class="of-empty">chargement des offres…</div>
+  </div>
+  <div class="of-detail" id="of-detail"
+       {% if selected_job %}hx-get="/offres/detail/{{ selected_job }}" hx-trigger="load" hx-swap="innerHTML"{% endif %}>
+    {% if not selected_job %}
+    <div class="of-empty">&larr; sélectionne une offre<br>
+      <span style="font-size:.7rem">le détail s'affiche ici, sans popup ni rechargement</span></div>
+    {% endif %}
+  </div>
+</div>
+
+<script>
+/* surbrillance de la ligne sélectionnée (le détail charge via hx-get sur le bouton) */
+document.body.addEventListener('click', e => {
+  const row = e.target.closest('.of-row[data-job]');
+  if (!row) return;
+  document.querySelectorAll('.of-row.sel').forEach(r => r.classList.remove('sel'));
+  row.classList.add('sel');
+});
+</script>
+{% endblock %}

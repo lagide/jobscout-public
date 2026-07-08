@@ -19,6 +19,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY *.py ./
 COPY connectors ./connectors
+COPY tests ./tests
 
 EXPOSE 8000
 

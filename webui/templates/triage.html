@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block title %}triage{% endblock %}
+{% block content %}
+<div class="phead"><span class="mk">&gt;pds</span><h1>triage</h1>
+  <span class="meta">batch · actions de masse</span></div>
+<div class="prompt">filtre, coche, agis — la table se met à jour sans rechargement</div>
+
+<form class="filters" id="tri-filters"
+      hx-get="/triage/table" hx-target="#tri-zone" hx-swap="innerHTML"
+      hx-trigger="submit, change, keyup from:input delay:400ms">
+  <input type="text" name="kw" placeholder="mot-clé…">
+  <select name="platform"><option value="">toutes plateformes</option>
+    {% for p in PLATFORMS %}<option value="{{ p }}">{{ p }}</option>{% endfor %}</select>
+  <select name="mode"><option value="">tous modes</option>
+    <option value="full_remote">remote</option><option value="hybrid">hybrid</option>
+    <option value="onsite">onsite</option></select>
+  <select name="min_score"><option value="0">score min : tous</option>
+    {% for s in [3,4,5,6,7] %}<option value="{{ s }}">≥ {{ s }}</option>{% endfor %}</select>
+  <select name="scope"><option value="actives">actives</option>
+    <option value="archivées">archivées</option><option value="toutes">toutes</option></select>
+  <select name="order_by"><option value="relevance">tri : pertinence</option>
+    <option value="content">tri : contenu</option><option value="date">tri : date</option>
+    <option value="scraped">tri : scrape</option></select>
+  <select name="size"><option>25</option><option selected>50</option>
+    <option>100</option><option>200</option></select>
+  <span class="htmx-indicator">chargement…</span>
+</form>
+
+<div id="tri-zone" hx-get="/triage/table" hx-trigger="load" hx-swap="innerHTML">
+  <div class="of-empty">chargement…</div>
+</div>
+
+{% if not request.state.readonly %}
+<div class="bulkbar">
+  <span id="sel-count" style="font-size:.78rem;color:var(--txt2)">0 sélectionnée(s)</span>
+  <button onclick="bulk('pipeline_in')">📥 → pipeline</button>
+  <button onclick="bulk('archive')">🗑 archiver</button>
+  <button onclick="bulk('unarchive')">♻️ désarchiver</button>
+  <button class="danger" onclick="bulkDelete()">❌ supprimer définitivement</button>
+  <span id="bulk-fb" style="flex:1"></span>
+</div>
+{% endif %}
+
+<script>
+function selectedIds() {
+  return [...document.querySelectorAll('.tri-ck:checked')].map(c => c.value);
+}
+function refreshCount() {
+  document.getElementById('sel-count').textContent =
+    selectedIds().length + ' sélectionnée(s)';
+}
+document.body.addEventListener('change', e => {
+  if (e.target.classList?.contains('tri-ck') || e.target.id === 'tri-ck-all') {
+    if (e.target.id === 'tri-ck-all')
+      document.querySelectorAll('.tri-ck').forEach(c => c.checked = e.target.checked);
+    refreshCount();
+  }
+});
+async function bulk(action) {
+  const ids = selectedIds();
+  if (!ids.length) return;
+  const body = new URLSearchParams({ action, ids: ids.join(',') });
+  const r = await fetch('/actions/bulk', { method: 'POST', body });
+  document.getElementById('bulk-fb').innerHTML = await r.text();
+  htmx.trigger('#tri-filters', 'submit');
+}
+function bulkDelete() {
+  const n = selectedIds().length;
+  if (!n) return;
+  if (confirm('Suppression DÉFINITIVE de ' + n + ' offre(s) — irréversible. Confirmer ?'))
+    bulk('delete');
+}
+</script>
+{% endblock %}

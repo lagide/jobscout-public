@@ -1,38 +1,84 @@
-"""APEC connector — https://www.apec.fr/candidat/recherche-emploi.html
+"""APEC connector — https://www.apec.fr
 
-APEC is a JS-heavy SPA that renders its listings through a GraphQL-like internal
-endpoint. Rather than reverse-engineer their private API (which changes), we use
-Playwright: load the search page, wait for the listings, scrape the DOM.
+Au lieu de Playwright (ancienne approche, lourde et bloquée par le mur de consentement),
+on tape directement le webservice JSON interne que le front interroge :
 
-Requires PLAYWRIGHT_ENABLED=true in .env.
+    POST https://www.apec.fr/cms/webservices/rechercheOffre
+
+Cet endpoint répond en JSON sans authentification (le login APEC n'est requis que
+pour *postuler*), et n'est pas bloqué par DataDome depuis une IP résidentielle.
+Connecteur keyword : un appel par terme de recherche.
 """
 from __future__ import annotations
 
 import logging
 import re
-from datetime import date, datetime, timedelta
-from typing import Optional
-from urllib.parse import urlencode
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Optional
+
+import httpx
 
 from .base import BaseConnector, ConnectorResult, JobRecord
-from .playwright_base import PlaywrightSession, is_playwright_enabled
+from .utils import cutoff_date
 
 logger = logging.getLogger(__name__)
 
 BASE = "https://www.apec.fr"
-SEARCH_URL = f"{BASE}/candidat/recherche-emploi.html"
+WS_URL = f"{BASE}/cms/webservices/rechercheOffre"
+DETAIL_URL = f"{BASE}/candidat/recherche-emploi.html/emploi/detail-offre"
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "fr-FR,fr;q=0.9",
+    "Content-Type": "application/json",
+    "Origin": BASE,
+    "Referer": f"{BASE}/candidat/recherche-emploi.html",
+}
+
+# "65 - 85 k€ brut annuel" / "46 k€ brut annuel" / "à partir de 50 k€ ..."
+_SALARY_RE = re.compile(r"(\d{1,3})\s*(?:-\s*(\d{1,3})\s*)?k€", re.IGNORECASE)
+
+
+def _parse_apec_date(s: Any) -> Optional[date]:
+    """'2026-06-06T20:44:35.000+0000' → date."""
+    if not s or not isinstance(s, str):
+        return None
+    txt = s.strip().replace("Z", "+0000")
+    # Normalise le fuseau '+0000' → '+00:00' pour fromisoformat.
+    m = re.search(r"([+-]\d{2})(\d{2})$", txt)
+    if m:
+        txt = txt[: m.start()] + f"{m.group(1)}:{m.group(2)}"
+    for fmt in (None, "%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            if fmt is None:
+                return datetime.fromisoformat(txt).date()
+            return datetime.strptime(txt, fmt).date()
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _parse_salary(txt: Any) -> tuple[Optional[float], Optional[float]]:
+    if not txt or not isinstance(txt, str):
+        return None, None
+    m = _SALARY_RE.search(txt)
+    if not m:
+        return None, None
+    lo = float(m.group(1)) * 1000
+    hi = float(m.group(2)) * 1000 if m.group(2) else lo
+    return lo, hi
 
 
 class ApecConnector(BaseConnector):
     platform_name = "apec"
-
-    def is_enabled(self) -> bool:
-        return is_playwright_enabled()
+    uses_search_terms = True
 
     async def scrape(
         self,
         *,
-        search_term: str,
+        search_term: Optional[str],
         location: str,
         country: str,
         hours_old: int,
@@ -40,133 +86,64 @@ class ApecConnector(BaseConnector):
     ) -> ConnectorResult:
         result = ConnectorResult()
 
-        if not is_playwright_enabled():
-            result.errors.append("apec: PLAYWRIGHT_ENABLED not set — connector disabled")
-            return result
-
-        # APEC is FR-only.
+        # APEC est FR-only.
         if country and country.lower() not in ("france", "fr"):
             return result
-
-        qs = urlencode({"motsCles": search_term})
-        url = f"{SEARCH_URL}?{qs}"
-        cutoff = date.today() - timedelta(days=max(1, hours_old // 24))
-
-        try:
-            async with PlaywrightSession() as page:
-                await page.goto(url, timeout=45_000, wait_until="domcontentloaded")
-
-                # Cookie consent — APEC's button says "Accepter tous les cookies".
-                # Try a few selectors; swallow failures.
-                for sel in [
-                    'button:has-text("Accepter tous les cookies")',
-                    'button:has-text("Accepter")',
-                    '#onetrust-accept-btn-handler',
-                    'button[aria-label*="Accept"]',
-                    'button[aria-label*="Accepter"]',
-                ]:
-                    try:
-                        await page.click(sel, timeout=2500)
-                        await page.wait_for_timeout(500)
-                        break
-                    except Exception:
-                        continue
-
-                # APEC's SPA posts search results after consent. Give it up to 20s.
-                # Selector: links to /detail-offre/<id>
-                try:
-                    await page.wait_for_selector(
-                        'a[href*="detail-offre"]',
-                        timeout=20_000,
-                    )
-                except Exception:
-                    result.errors.append(
-                        "apec: no results selector appeared (listings may require "
-                        "JS interaction or APEC changed its markup)"
-                    )
-                    return result
-
-                # Scroll to trigger lazy-loading of more cards
-                for _ in range(3):
-                    await page.evaluate("window.scrollBy(0, window.innerHeight)")
-                    await page.wait_for_timeout(600)
-
-                # Extract links + surrounding card info
-                cards_data = await page.evaluate("""
-                    () => {
-                        const anchors = Array.from(document.querySelectorAll(
-                            'a[href*="detail-offre"]'
-                        ));
-                        const seen = new Set();
-                        const out = [];
-                        for (const a of anchors) {
-                            const href = a.getAttribute('href');
-                            if (!href || seen.has(href)) continue;
-                            seen.add(href);
-                            const card = a.closest('div[class*="card"], article, li, [class*="result"]') || a.parentElement;
-                            const text = card ? card.innerText : a.innerText;
-                            const lines = text.split('\\n').map(l => l.trim()).filter(Boolean);
-                            out.push({
-                                href,
-                                title: lines[0] || '',
-                                rawLines: lines.slice(0, 10),
-                            });
-                        }
-                        return out;
-                    }
-                """)
-        except Exception as e:
-            result.errors.append(f"apec playwright: {type(e).__name__}: {e}")
+        if not search_term:
             return result
 
-        for c in cards_data[: results_wanted * 2]:
+        body = {
+            "motsCles": search_term,
+            "pagination": {"range": max(20, results_wanted), "startIndex": 0},
+            "sorts": [{"type": "DATE", "direction": "DESCENDING"}],
+            "activeFiltre": True,
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=25, headers=HEADERS, follow_redirects=True) as client:
+                r = await client.post(WS_URL, json=body)
+                r.raise_for_status()
+                data = r.json()
+        except Exception as e:
+            result.errors.append(f"apec request failed: {type(e).__name__}: {e}")
+            return result
+
+        offres = data.get("resultats") or []
+        cutoff = cutoff_date(hours_old)
+
+        for o in offres:
             try:
-                href = c.get("href", "")
-                if not href:
-                    continue
-                if not href.startswith("http"):
-                    href = BASE + href
-
-                title = c.get("title") or ""
-                if not title or len(title) < 4:
+                num = o.get("numeroOffre") or str(o.get("id") or "")
+                title = (o.get("intitule") or "").strip()
+                if not num or not title:
                     continue
 
-                lines = c.get("rawLines") or []
-                company = lines[1] if len(lines) > 1 else None
-                loc = lines[2] if len(lines) > 2 else "France"
-
-                # Detect "Il y a X j." pattern
-                posted = None
-                for line in lines:
-                    m = re.search(r"il\s*y\s*a\s*(\d+)\s*j", line, re.IGNORECASE)
-                    if m:
-                        posted = date.today() - timedelta(days=int(m.group(1)))
-                        break
-                    if re.search(r"aujourd", line, re.IGNORECASE):
-                        posted = date.today()
-                        break
+                posted = _parse_apec_date(o.get("datePublication") or o.get("dateValidation"))
                 if posted and posted < cutoff:
                     continue
 
+                lo, hi = _parse_salary(o.get("salaireTexte"))
+                loc = (o.get("lieuTexte") or "France").strip()
+
                 rec: JobRecord = {
                     "site": self.platform_name,
-                    "id": href.rsplit("/", 1)[-1][:100] if "/" in href else None,
+                    "id": str(num)[:100],
                     "title": title[:400],
-                    "company": company,
+                    "company": (o.get("nomCommercial") or None),
                     "location": loc,
-                    "description": None,
-                    "job_url": href,
+                    "description": (o.get("texteOffre") or None),
+                    "job_url": f"{DETAIL_URL}/{num}",
                     "date_posted": posted.isoformat() if posted else None,
-                    "is_remote": None,
-                    "currency": None,
-                    "min_amount": None,
-                    "max_amount": None,
-                    "interval": None,
+                    "is_remote": None,  # enrichment.detect_work_mode déduira depuis le texte
+                    "currency": "EUR" if (lo or hi) else None,
+                    "min_amount": lo,
+                    "max_amount": hi,
+                    "interval": "yearly" if (lo or hi) else None,
                     "job_type": None,
                 }
                 result.records.append(rec)
             except Exception as e:
-                result.errors.append(f"apec parse: {e}")
+                result.errors.append(f"apec parse: {type(e).__name__}: {e}")
 
         if len(result.records) > results_wanted:
             result.records = result.records[:results_wanted]

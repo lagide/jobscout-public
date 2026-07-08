@@ -57,6 +57,10 @@ class Job(Base):
     date_posted: Mapped[Optional[date]] = mapped_column(Date, index=True, nullable=True)
     scraped_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow_naive, index=True)
 
+    # Marqué à chaque scrape qui revoit cette offre. Si > JOB_NOT_SEEN_DAYS sans
+    # être revu → considéré pourvu/retiré et purgé par cleanup_database.
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow_naive, index=True)
+
     # Claude-computed relevance (populated asynchronously post-insertion)
     relevance_score: Mapped[Optional[float]] = mapped_column(Float, index=True, nullable=True)
     relevance_reasoning: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -107,7 +111,8 @@ class Job(Base):
     score_freshness: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
     # --- Phase 3 additions (Kanban pipeline) ---
-    # One of: None (not tracked) / "to_study" / "interesting" / "applied" / "interview" / "closed"
+    # One of: None (not tracked) / "to_study" / "interesting" / "applied" / "interview" / "in_process" / "closed"
+    # ("in_process" = entretien passé, étapes suivantes du processus en cours — ajouté 2026-07-02)
     application_status: Mapped[Optional[str]] = mapped_column(String(32), index=True, nullable=True)
 
     # Date of actual application (set when status moves to "applied" or later).

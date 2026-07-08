@@ -1,0 +1,21 @@
+<div style="font-size:.74rem;color:var(--txt2);padding:2px 2px 6px">{{ total }} offres · triées par contenu</div>
+{% for g in groups %}
+<div class="of-grp">
+  <span class="sq" style="background:{{ g.hue }}"></span>
+  <span class="lb">{{ g.label }}</span><span class="fu">{{ g.full }}</span>
+  <span class="ct">{{ g.rows|length }} · moy. {{ g.avg|fmt_score }}</span>
+</div>
+{% for o in g.rows[:40] %}
+<button class="of-row anim-li" data-job="{{ o.id }}"
+        hx-get="/offres/detail/{{ o.id }}" hx-target="#of-detail" hx-swap="innerHTML">
+  <span class="sc score {{ o.base_score|score_class }}">{{ o.base_score|fmt_score }}</span>
+  <span class="ti">{{ o.title }}<span class="co">{{ o.company or '' }} · {{ o.platform }}</span></span>
+  <span class="pl">{{ o|fmt_age }}</span>
+</button>
+{% endfor %}
+{% if g.rows|length > 40 %}
+<div style="font-size:.7rem;color:var(--dim);padding:6px 8px">+ {{ g.rows|length - 40 }} autres (affiner les filtres)</div>
+{% endif %}
+{% else %}
+<div class="of-empty">aucune offre pour ces filtres</div>
+{% endfor %}

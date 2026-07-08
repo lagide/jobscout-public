@@ -40,17 +40,27 @@ class BaseConnector(ABC):
 
     platform_name: str  # must match the key used in SearchRequest.sites
 
+    # Quand True (défaut), le scraper appelle scrape() une fois par terme de
+    # recherche libre (modèle keyword historique). Quand False, le connector est
+    # "structuré" : il construit sa propre requête depuis des filtres (codes ROME,
+    # qualification, départements…) et ignore le texte libre — le scraper ne
+    # l'appelle alors **qu'une seule fois par profil** (search_term=None).
+    uses_search_terms: bool = True
+
     @abstractmethod
     async def scrape(
         self,
         *,
-        search_term: str,
+        search_term: Optional[str],
         location: str,
         country: str,
         hours_old: int,
         results_wanted: int,
     ) -> ConnectorResult:
-        """Run one search. Must not raise — return errors in the result instead."""
+        """Run one search. Must not raise — return errors in the result instead.
+
+        Pour un connector structuré (uses_search_terms=False), search_term vaut None.
+        """
 
     def is_enabled(self) -> bool:
         """Override to gate on env-var configuration (e.g. missing API key)."""

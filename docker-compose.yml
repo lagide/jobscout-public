@@ -1,6 +1,12 @@
-# JobScout — 2 services: FastAPI backend + Streamlit frontend.
-# Shared network; SQLite DB persisted in a named volume.
-# Health checks disabled to avoid Docker 24.0.2 daemon crash bug.
+# JobScout — FastAPI backend + HTMX/Jinja2 webui, SQLite persisted in a named volume.
+#
+# Quickstart:
+#   cp .env.example .env   # then fill in at least one scoring provider key
+#   docker compose up -d --build
+#   open http://localhost:8502
+#
+# Health checks are disabled here to avoid a Docker 24.0.2 daemon crash bug on
+# some NAS/embedded distros — see scripts/healthcheck.sh for an external probe.
 
 services:
   backend:
@@ -9,13 +15,12 @@ services:
     env_file: .env
     environment:
       DB_PATH: /data/jobs.db
-      # Override defaults here if desired:
-      # SCORING_MODEL: anthropic/claude-haiku-4.5
-      # REFRESH_INTERVAL_HOURS: "6"
-      # RUN_ON_STARTUP: "true"
-      # SCORING_CONCURRENCY: "4"
     volumes:
       - jobscout-data:/data
+      # "Config chaude" — blacklist.json, scoring_prompt.txt, geo_scope.json,
+      # settings.json, secrets.json. Editable live via the Paramètres page
+      # (or by hand + POST /config/reload), no rebuild needed.
+      - ./config:/app/config
     ports:
       - "8000:8000"
     restart: unless-stopped
@@ -24,13 +29,16 @@ services:
     networks:
       - jobscout-net
 
-  frontend:
-    build: ./frontend
-    container_name: jobscout-frontend
+  webui:
+    build: ./webui
+    container_name: jobscout-webui
     environment:
       BACKEND_URL: http://backend:8000
+      # Set this to require a token for write actions (see README "Read-only
+      # public deployment"). Empty = full read/write access.
+      JOBSCOUT_ADMIN_TOKEN: ${JOBSCOUT_ADMIN_TOKEN:-}
     ports:
-      - "8501:8501"
+      - "8502:8502"
     depends_on:
       - backend
     restart: unless-stopped

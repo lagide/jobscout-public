@@ -24,6 +24,7 @@ from typing import Optional
 import httpx
 
 from .base import BaseConnector, ConnectorResult, JobRecord
+from .utils import cutoff_dt
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +85,9 @@ class WorkdayConnector(BaseConnector):
         return bool(self._sites())
 
     def _sites(self) -> list[tuple[str, str]]:
-        return _parse_sites(os.getenv("WORKDAY_SITES", ""))
+        # Page Paramètres > connecteurs (env WORKDAY_SITES = défaut au premier boot).
+        from settings import get
+        return _parse_sites(",".join(get().connectors.workday_sites))
 
     async def scrape(
         self,
@@ -101,7 +104,7 @@ class WorkdayConnector(BaseConnector):
             result.errors.append("workday: no sites configured (set WORKDAY_SITES)")
             return result
 
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_old)
+        cutoff = cutoff_dt(hours_old)
 
         async with httpx.AsyncClient(
             timeout=20,

@@ -6,10 +6,14 @@ from typing import Optional
 from .apec import ApecConnector
 from .base import BaseConnector
 from .francetravail import FranceTravailConnector
+from .cadremploi import CadremploiConnector
+from .choisirservicepublic import ChoisirServicePublicConnector
 from .freework import FreeWorkConnector
+from .hellowork import HelloWorkConnector
 from .greenhouse import GreenhouseConnector
 from .himalayas import HimalayasConnector
 from .remotive import RemotiveConnector
+from .welcometothejungle import WelcomeToTheJungleConnector
 from .workday import WorkdayConnector
 
 CONNECTOR_REGISTRY: dict[str, BaseConnector] = {
@@ -20,6 +24,10 @@ CONNECTOR_REGISTRY: dict[str, BaseConnector] = {
     "greenhouse": GreenhouseConnector(),
     "workday": WorkdayConnector(),
     "apec": ApecConnector(),
+    "wttj": WelcomeToTheJungleConnector(),
+    "hellowork": HelloWorkConnector(),
+    "cadremploi": CadremploiConnector(),
+    "choisirservicepublic": ChoisirServicePublicConnector(),
 }
 
 

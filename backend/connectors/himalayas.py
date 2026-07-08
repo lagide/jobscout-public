@@ -19,6 +19,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from .base import BaseConnector, ConnectorResult, JobRecord
+from .utils import cutoff_ts
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,7 @@ class HimalayasConnector(BaseConnector):
             result.errors.append(f"himalayas parse failed: {e}")
             return result
 
-        cutoff = datetime.now(timezone.utc).timestamp() - hours_old * 3600
+        cutoff = cutoff_ts(hours_old)
 
         # Primary path: Next.js hydration blob contains all jobs as JSON — parse <script id="__NEXT_DATA__">
         nd = soup.find("script", {"id": "__NEXT_DATA__"})

@@ -1,0 +1,27 @@
+<div style="font-size:.74rem;color:var(--txt2);margin-bottom:10px">{{ total }} offres dans le pipeline</div>
+<div class="board">
+{% for k in KANBAN_ORDER %}
+<div class="kcol" data-status="{{ k }}">
+  <div class="kcol__h"><span class="kcol__t">{{ STATUS[k].glyph }} {{ STATUS[k].label }}</span>
+    <span class="kcol__n">{{ cols[k]|length }}</span></div>
+  <div class="kcol__b">
+  {% for j in cols[k] %}
+    <div class="kc anim-li" draggable="true" data-id="{{ j.id }}" title="clic pour le détail · glisser pour déplacer">
+      <div class="t">{{ j.title[:64] }}</div>
+      <div class="m"><span>{{ (j.company or '?')[:20] }}</span>
+        <span class="sc score {{ j.relevance_score|score_class }}">{{ j.relevance_score|fmt_score }}</span></div>
+      <div class="m" style="margin-top:4px">
+        <span>{{ j|fmt_age }}{% if j.applied_date %} · postulé {{ j.applied_date|fmt_age }}{% endif %}</span>
+        <button style="margin-left:auto;padding:1px 7px;font-size:.62rem;border:none" title="retirer du pipeline"
+          hx-post="/pipeline/move" hx-vals='{"job_id": {{ j.id }}, "status": ""}'
+          hx-target="#board" hx-swap="innerHTML">✕</button>
+      </div>
+    </div>
+  {% endfor %}
+  </div>
+</div>
+{% endfor %}
+</div>
+{% if total == 0 %}
+<div class="of-empty">pipeline vide · ajoute des offres depuis Offres ou Triage</div>
+{% endif %}

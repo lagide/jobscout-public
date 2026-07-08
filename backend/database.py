@@ -110,6 +110,14 @@ def _migrate() -> None:
     # Phase 5 — métrique blacklist sur les ScrapeLog
     _ensure_column("scrape_logs", "blacklisted", "INTEGER DEFAULT 0 NOT NULL")
 
+    # Phase 6 — détection annonces pourvues (last_seen_at). Backfill des lignes
+    # existantes avec scraped_at pour démarrer le compteur depuis ce qu'on sait.
+    _ensure_column("jobs", "last_seen_at", "DATETIME")
+    with engine.begin() as conn:
+        conn.execute(text(
+            "UPDATE jobs SET last_seen_at = scraped_at WHERE last_seen_at IS NULL"
+        ))
+
     # Index sur les nouvelles colonnes (IF NOT EXISTS = no-op si déjà présent)
     for ddl in (
         'CREATE INDEX IF NOT EXISTS "ix_jobs_content_hash" ON "jobs"("content_hash")',
@@ -118,6 +126,7 @@ def _migrate() -> None:
         'CREATE INDEX IF NOT EXISTS "ix_jobs_work_mode" ON "jobs"("work_mode")',
         'CREATE INDEX IF NOT EXISTS "ix_jobs_language" ON "jobs"("language")',
         'CREATE INDEX IF NOT EXISTS "ix_jobs_application_status" ON "jobs"("application_status")',
+        'CREATE INDEX IF NOT EXISTS "ix_jobs_last_seen_at" ON "jobs"("last_seen_at")',
     ):
         _ensure_index(ddl)
 

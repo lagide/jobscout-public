@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}cockpit{% endblock %}
+{% block content %}
+<div class="phead"><span class="mk">&gt;pds</span><h1>cockpit</h1>
+  <span class="meta">{{ now.strftime('%Y-%m-%d · %H:%M') }}</span></div>
+<div class="prompt" data-type-once>briefing du jour · {{ sys_stats.scored if sys_stats else '—' }} offres scorées · webui</div>
+
+<div class="kpis">
+  <div class="kpi"><div class="v" data-countup="{{ sys_stats.total_jobs if sys_stats else 0 }}">0</div><div class="l">offres indexées</div></div>
+  <div class="kpi"><div class="v" data-countup="{{ sys_stats.scored if sys_stats else 0 }}">0</div><div class="l">scorées</div></div>
+  <div class="kpi"><div class="v accent" data-countup="{{ pipe_total }}">0</div><div class="l">en pipeline</div></div>
+  <div class="kpi"><div class="v" data-countup="{{ hdb.jobs_archived or 0 }}">0</div><div class="l">archivées</div></div>
+  <div class="kpi"><div class="v">{{ hdb.db_mb or '—' }}<span style="font-size:.9rem"> Mo</span></div><div class="l">taille base</div></div>
+</div>
+
+<div class="grid2" style="grid-template-columns:repeat(auto-fit,minmax(190px,1fr));margin-bottom:16px">
+  <div class="card" style="margin:0"><div class="card__b">
+    <div class="card__t" style="margin-bottom:12px">ÉVOLUTION · 14 J</div>
+    <svg viewBox="0 0 260 70" preserveAspectRatio="none" style="width:100%;height:78px;display:block">
+      <polyline class="drawable" points="{{ evo_total }}" fill="none" stroke="#5a6a7e" stroke-width="1.6"/>
+      <polyline class="drawable" points="{{ evo_scored }}" fill="none" stroke="#00CC33" stroke-width="1.8"/>
+    </svg>
+    <div style="display:flex;gap:14px;margin-top:8px;font-size:.66rem;color:var(--dim)">
+      <span><span style="color:#5a6a7e">—</span> scrapées</span>
+      <span><span style="color:var(--green-dim)">—</span> scorées</span>
+    </div>
+  </div></div>
+
+  <div class="card" style="margin:0"><div class="card__b">
+    <div class="card__t" style="margin-bottom:12px">SCORES · CONTENU</div>
+    {% for d in dist %}
+    <div class="sbar"><span class="l">{{ d.band }}</span>
+      <span class="tr"><span class="fl {{ 'final' if d.hot }}" data-w="{{ d.pct }}"></span></span>
+      <span class="n">{{ d.count }}</span></div>
+    {% endfor %}
+  </div></div>
+
+  <div class="card" style="margin:0"><div class="card__b">
+    <div class="card__t" style="margin-bottom:12px">FAMILLES CIBLES</div>
+    {% for f in fams %}
+    <div class="sbar"><span class="l" style="width:108px">{{ f.label }}</span>
+      <span class="tr"><span class="fl" data-w="{{ f.pct }}" style="background:{{ f.hue }}"></span></span>
+      <span class="n">{{ f.count }}</span></div>
+    {% endfor %}
+  </div></div>
+
+  {% if not request.state.readonly %}
+  <div class="card" style="margin:0"><div class="card__b">
+    <div class="card__t" style="margin-bottom:12px">PIPELINE</div>
+    {% for k in KANBAN_ORDER if k != 'closed' %}
+    <div class="kv" style="padding:6px 0">
+      <span class="k" style="font-size:.74rem">{{ STATUS[k].glyph }} {{ STATUS[k].label }}</span>
+      <span style="font-family:var(--display);font-weight:600">{{ pipe_counts[k] }}</span>
+    </div>
+    {% endfor %}
+  </div></div>
+  {% endif %}
+</div>
+
+<div class="split" style="grid-template-columns:1.45fr 1fr">
+  <div>
+    <div class="card__t" style="margin-bottom:10px">TOP OFFRES · CONTENU ≥ 6 — cliquer pour le détail</div>
+    {% for o in top %}
+    <a class="of-row anim-li" href="/offres?job={{ o.id }}">
+      <span class="sc score {{ o.base_score|score_class }}">{{ o.base_score|fmt_score }}</span>
+      <span class="ti">{{ o.title }}<span class="co">{{ o.company or '' }} · {{ o|fmt_age }}</span></span>
+      <span class="wm">{% if o.work_mode %}<span class="tag {{ 'tag--green' if o.work_mode=='full_remote' else 'tag--cyan' if o.work_mode=='hybrid' }}">{{ WORK_MODE_LABEL.get(o.work_mode,'') }}</span>{% endif %}</span>
+      <span class="fam"><i style="background:{{ FAMILIES[detect_family(o.title)].hue }}"></i>{{ FAMILIES[detect_family(o.title)].label }}</span>
+    </a>
+    {% else %}
+    <div class="of-empty">aucune offre ≥ 6 pour l'instant</div>
+    {% endfor %}
+  </div>
+  <div>
+    <div class="card"><div class="card__h"><div class="dots"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i></div>
+      <span class="card__t">system_status</span></div>
+      <div class="card__b">
+        <div class="kv"><span class="k">BACKEND</span><span class="v"><span class="online"></span>online</span></div>
+        <div class="kv"><span class="k">DERNIER RUN</span><span class="v">{{ last_scrape|fmt_age if last_scrape else '—' }}</span></div>
+        <div class="kv"><span class="k">SOURCES</span><span class="v">{{ nsrc }}/8 actives</span></div>
+        <div class="kv"><span class="k">SCORING</span><span class="v">{{ sys_stats.scored if sys_stats else '—' }}/{{ sys_stats.total_jobs if sys_stats else '—' }}</span></div>
+      </div>
+    </div>
+    {% if not request.state.readonly %}
+    <div class="card__t" style="margin:6px 0 10px">ACTIONS</div>
+    <div id="ck-feedback"></div>
+    <button class="primary" style="width:100%;margin-bottom:8px"
+      hx-post="/ops/scrape" hx-target="#ck-feedback" hx-swap="innerHTML">
+      ▷ lancer un scrape <span class="htmx-indicator">… en cours (1-2 min)</span></button>
+    <button style="width:100%"
+      hx-post="/ops/rescore" hx-target="#ck-feedback" hx-swap="innerHTML">
+      ↻ re-scorer les manquants <span class="htmx-indicator">…</span></button>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

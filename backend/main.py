@@ -1,20 +1,26 @@
-"""Point d'entrée FastAPI — endpoints, scheduler géré par lifespan, CORS pour Streamlit."""
+"""Point d'entrée FastAPI — endpoints REST, scheduler géré par lifespan, CORS pour le webui."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, Body, FastAPI, HTTPException, Query
+from pydantic import ValidationError
 from sqlalchemy import delete as sqla_delete
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import and_, desc, func, or_
 
+import constants
+import geo_scope
+import settings as app_settings
 from constants import GEO_PROFILES
-from database import get_session, init_db
+from database import DB_PATH, get_session, init_db
 from models import Job, ScrapeLog
 from schemas import (
     ApplicationStatusUpdate,
@@ -32,24 +38,75 @@ from schemas import (
     SearchResponse,
     StatsResponse,
 )
-from scheduler import build_scheduler
+import scheduler as scheduler_module
+import scoring
+from enrichment import compute_final_score
+from scheduler import build_scheduler, refresh_freshness
 from scoring import rescore_all_force, rescore_all_missing, score_jobs_background
 from scraper import scrape_and_store
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s — %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+class _RedactSecretsFilter(logging.Filter):
+    """Masque les valeurs des secrets d'environnement dans les logs.
+
+    Le .env contient GROQ_API_KEY, OPENROUTER_API_KEY, FT_CLIENT_SECRET… ;
+    les erreurs HTTP des providers peuvent embarquer ces valeurs (URL, headers).
+    Sans ce filtre, un simple `docker logs jobscout-backend` suffirait à les
+    exfiltrer. On collecte les VALEURS au démarrage et on les remplace partout.
+    """
+
+    _NAME_RE = re.compile(r"(KEY|SECRET|TOKEN|PASSWORD|PASSWD)", re.IGNORECASE)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._secrets = [
+            v for k, v in os.environ.items()
+            if self._NAME_RE.search(k) and v and len(v) >= 8
+        ]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+            redacted = msg
+            for secret in self._secrets:
+                if secret in redacted:
+                    redacted = redacted.replace(secret, "[REDACTED]")
+            if redacted != msg:
+                record.msg = redacted
+                record.args = ()
+        except Exception:
+            pass  # un filtre de log ne doit jamais faire échouer le logging
+        return True
+
+
+# Posé sur les HANDLERS du root logger : s'applique ainsi à TOUS les records
+# (un filtre posé sur le logger root ne filtre que ses logs directs).
+for _h in logging.getLogger().handlers:
+    _h.addFilter(_RedactSecretsFilter())
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting up — initializing DB")
     init_db()
+    # Amorçage de la config chaude (volume ./config) : settings.json, blacklist,
+    # prompt. No-op si les fichiers existent déjà — on n'écrase jamais une
+    # config éditée via la page Paramètres.
+    app_settings.export_defaults()
+    constants.export_default_blacklist()
+    scoring.export_default_prompt()
     scheduler = build_scheduler()
     scheduler.start()
     logger.info("Scheduler started — %d job(s) registered", len(scheduler.get_jobs()))
+    # Rafraîchit les scores de fraîcheur au boot (ils dérivent d'un jour à
+    # l'autre — recalcul déterministe, sans LLM, ~1s pour 1000 offres).
+    asyncio.create_task(refresh_freshness())
     yield
     logger.info("Shutting down scheduler")
     scheduler.shutdown(wait=False)
@@ -66,7 +123,7 @@ app = FastAPI(
 # (séparées par virgule). Mettre "*" pour autoriser tout — déconseillé car cette
 # API n'a pas d'authentification et expose /search, /rescore qui peuvent générer
 # des coûts (OpenRouter) ou modifier l'état.
-_DEFAULT_ORIGINS = "http://localhost:8501"
+_DEFAULT_ORIGINS = "http://localhost:8501,http://localhost:8502"
 _ALLOWED_ORIGINS = [
     o.strip() for o in os.getenv("ALLOWED_ORIGINS", _DEFAULT_ORIGINS).split(",") if o.strip()
 ]
@@ -183,7 +240,7 @@ def health() -> dict[str, str]:
 @app.get("/health/db-size")
 def health_db_size() -> dict:
     """Return DB file size + row counts for monitoring retention growth."""
-    db_path = "/data/jobs.db"
+    db_path = str(DB_PATH)
     size_bytes = os.path.getsize(db_path) if os.path.exists(db_path) else 0
     wal_path = db_path + "-wal"
     shm_path = db_path + "-shm"
@@ -210,6 +267,26 @@ def health_db_size() -> dict:
         "jobs_applied": jobs_applied,
         "scrape_logs_total": logs_total,
     }
+
+
+@app.post("/config/reload")
+def config_reload() -> dict:
+    """Recharge la config chaude depuis /app/config (volume monté).
+
+    Fichiers pris en compte (fallback sur les valeurs codées si absents) :
+        config/settings.json        — configuration centralisée (page Paramètres)
+        config/blacklist.json       — title_patterns / title_abbr / companies
+        config/scoring_prompt.txt   — system prompt du scoring LLM
+        config/geo_scope.json       — périmètre géographique des offres
+    Permet de modifier la config SANS rebuild de l'image.
+    """
+    settings_result = app_settings.reload()
+    app_settings.apply_runtime()
+    blacklist = constants.reload_blacklist()
+    prompt = scoring.reload_prompt()
+    geo = geo_scope.reload_geo_scope()
+    return {"settings": settings_result, "blacklist": blacklist,
+            "prompt": prompt, "geo_scope": geo}
 
 
 @app.get("/profiles", response_model=list[GeoProfileOut])
@@ -244,10 +321,14 @@ def list_jobs(
     language: Optional[list[str]] = Query(None, description="Filter by detected language code (fr/en/de)."),
     min_salary: Optional[float] = Query(None, ge=0),
     min_score: Optional[float] = Query(None, ge=0, le=10),
+    min_base_score: Optional[float] = Query(
+        None, ge=0, le=10,
+        description="Filtre sur le score de CONTENU Claude (base_score), avant pondération géo/salaire/fraîcheur.",
+    ),
     remote_only: bool = False,
     application_status: Optional[list[str]] = Query(
         None,
-        description="to_study / interesting / applied / interview / closed",
+        description="to_study / interesting / applied / interview / in_process / closed",
     ),
     in_pipeline: Optional[bool] = Query(
         None,
@@ -256,7 +337,7 @@ def list_jobs(
     include_archived: bool = False,
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
-    order_by: str = Query("relevance", pattern="^(relevance|date|scraped)$"),
+    order_by: str = Query("relevance", pattern="^(relevance|content|date|scraped)$"),
     light: bool = Query(
         False,
         description="Si true : payload allégé (description + sources vidées) — utile pour "
@@ -297,6 +378,8 @@ def list_jobs(
             )
         if min_score is not None:
             q = q.filter(Job.relevance_score >= min_score)
+        if min_base_score is not None:
+            q = q.filter(Job.base_score >= min_base_score)
         if remote_only:
             q = q.filter(Job.is_remote.is_(True))
         if application_status:
@@ -312,6 +395,12 @@ def list_jobs(
 
         if order_by == "relevance":
             q = q.order_by(Job.relevance_score.desc().nullslast(), Job.scraped_at.desc())
+        elif order_by == "content":
+            q = q.order_by(
+                Job.base_score.desc().nullslast(),
+                Job.relevance_score.desc().nullslast(),
+                Job.scraped_at.desc(),
+            )
         elif order_by == "date":
             q = q.order_by(Job.date_posted.desc().nullslast(), Job.scraped_at.desc())
         else:
@@ -541,6 +630,441 @@ def set_archived(job_id: int, body: ArchiveUpdate) -> JobOut:
         job.archived = body.archived
     with get_session() as s:
         return _job_to_out(s.get(Job, job_id))
+
+
+# ---------- Paramètres — configuration centralisée (page Paramètres du webui) ----------
+
+# Fiche descriptive par source, affichée dans le catalogue de l'UI.
+# desc = méthode d'accès ; note = retour d'expérience opérationnel ;
+# requires = credentials/config nécessaires (noms de secrets ou de réglages).
+_SOURCE_INFO: dict[str, dict] = {
+    "linkedin":  {"desc": "via JobSpy — scraping des pages de recherche publiques",
+                  "note": "source la plus volumineuse ; pas de date de publication fiable"},
+    "indeed":    {"desc": "via JobSpy — API mobile non officielle",
+                  "note": "liens jk éphémères ; le lien direct employeur est promu quand dispo"},
+    "glassdoor": {"desc": "via JobSpy",
+                  "note": "anti-bot DataDome (403) — historiquement inexploitable"},
+    "zip_recruiter": {"desc": "via JobSpy",
+                      "note": "orienté US/CA — peu de résultats FR"},
+    "google":    {"desc": "via JobSpy — Google Jobs (paramètre google_search_term dédié)",
+                  "note": "Google sert la version sans JS au NAS → 0 résultat (limite "
+                          "upstream JobSpy, même regex en 1.1.82) — garder désactivé"},
+    "francetravail": {"desc": "API officielle (OAuth2) — requête structurée par codes ROME "
+                              "+ qualification cadre + départements, PAS par mots-clés",
+                      "note": "source la plus propre ; config fine dans « connecteurs »",
+                      "requires": ["FT_CLIENT_ID", "FT_CLIENT_SECRET"]},
+    "freework":  {"desc": "API interne + fallback HTML", "note": "freelance/tech FR"},
+    "himalayas": {"desc": "scraping HTML", "note": "Cloudflare challenge — historiquement 0 résultat"},
+    "remotive":  {"desc": "API JSON publique", "note": "remote monde — 0 résultat sur profil FR"},
+    "greenhouse": {"desc": "API JSON publique par board d'entreprise (ATS)",
+                   "note": "boards à lister dans « connecteurs » ; filtre géo à l'ingestion",
+                   "requires": ["greenhouse_boards"]},
+    "workday":   {"desc": "API JSON par tenant d'entreprise (ATS)",
+                  "note": "tenants à lister dans « connecteurs »",
+                  "requires": ["workday_sites"]},
+    "apec":      {"desc": "webservice JSON interne", "note": "cadres FR — actif depuis 2026-06"},
+    "wttj":      {"desc": "API Algolia de Welcome to the Jungle", "note": "startups/scale-ups FR"},
+    "hellowork": {"desc": "scraping HTML direct", "note": "généraliste FR"},
+    "cadremploi": {"desc": "scraping HTML direct", "note": "HTTP 403 intermittents (anti-bot)"},
+    "choisirservicepublic": {"desc": "API JSON — offres fonction publique, domaine SI",
+                             "note": "domaine(s) via CSP_DOMAINS (.env)"},
+}
+
+
+def _sites_catalog() -> list[dict]:
+    """Catalogue de toutes les sources connues, avec leur état effectif."""
+    from connectors import get_connector, registered_platforms
+
+    selected = set(app_settings.get().search.sites)
+    catalog: list[dict] = []
+    for name in app_settings.JOBSPY_SITES:
+        info = _SOURCE_INFO.get(name, {})
+        catalog.append({
+            "name": name,
+            "kind": "jobspy",
+            "available": True,
+            "selected": name in selected,
+            "structured": False,
+            "desc": info.get("desc"),
+            "note": info.get("note"),
+            "requires": info.get("requires", []),
+        })
+    for name in registered_platforms():
+        conn = get_connector(name)
+        info = _SOURCE_INFO.get(name, {})
+        catalog.append({
+            "name": name,
+            "kind": "connector",
+            "available": bool(conn and conn.is_enabled()),
+            "selected": name in selected,
+            "structured": not getattr(conn, "uses_search_terms", True),
+            "desc": info.get("desc"),
+            "note": info.get("note"),
+            "requires": info.get("requires", []),
+        })
+    return catalog
+
+
+def _settings_payload() -> dict:
+    """Réponse commune GET/PUT /settings — état complet pour la page Paramètres."""
+    return {
+        "settings": app_settings.get().model_dump(),
+        "defaults": app_settings.AppSettings().model_dump(),
+        "secrets": app_settings.secret_status(),
+        "sites": _sites_catalog(),
+        "next_scrape": scheduler_module.next_scrape_run(),
+    }
+
+
+@app.get("/settings")
+def get_settings() -> dict:
+    """Configuration effective + catalogue des sources + statut (masqué) des clés."""
+    return _settings_payload()
+
+
+@app.put("/settings")
+def put_settings(patch: dict[str, Any] = Body(...)) -> dict:
+    """Applique un patch partiel (par section), valide, persiste, applique à chaud.
+
+    Exemple de body : {"weights": {"content": 0.5, "geo": 0.25}}. Une validation
+    en échec (somme des poids ≠ 1, source inconnue…) renvoie 422 et ne change rien.
+    """
+    try:
+        app_settings.update(patch)
+    except (ValidationError, ValueError) as e:
+        raise HTTPException(422, detail=str(e))
+    return _settings_payload()
+
+
+@app.post("/settings/reset")
+def reset_settings(section: Optional[str] = Query(
+    None, description="Section à réinitialiser (weights/llm/search/scheduler) — vide = tout.",
+)) -> dict:
+    """Réinitialise une section (ou toute la config) aux défauts codés + .env."""
+    try:
+        app_settings.reset(section)
+    except ValueError as e:
+        raise HTTPException(422, detail=str(e))
+    return _settings_payload()
+
+
+@app.post("/settings/secrets")
+def set_settings_secret(body: dict[str, Any] = Body(...)) -> dict:
+    """Pose (ou retire si value vide) une clé API dans config/secrets.json.
+
+    Body : {"name": "GROQ_API_KEY", "value": "gsk_…"} — value vide/absente retire
+    la surcharge (retour au .env). La valeur n'est JAMAIS renvoyée par l'API.
+    """
+    name = str(body.get("name", ""))
+    value = body.get("value")
+    try:
+        app_settings.set_secret(name, value if value is None else str(value))
+    except ValueError as e:
+        raise HTTPException(422, detail=str(e))
+    return {"secrets": app_settings.secret_status()}
+
+
+@app.get("/config/prompt")
+def get_prompt() -> dict:
+    """System prompt de scoring effectif (pour édition dans la page Paramètres)."""
+    return scoring.get_prompt()
+
+
+@app.put("/config/prompt")
+def put_prompt(body: dict[str, Any] = Body(...)) -> dict:
+    """Écrit config/scoring_prompt.txt et recharge. Body : {"text": "..."}."""
+    try:
+        return scoring.save_prompt(str(body.get("text", "")))
+    except ValueError as e:
+        raise HTTPException(422, detail=str(e))
+
+
+@app.post("/config/prompt/reset")
+def reset_prompt() -> dict:
+    """Restaure le prompt par défaut (réécrit le fichier depuis le code)."""
+    scoring.export_default_prompt(force=True)
+    return scoring.reload_prompt()
+
+
+@app.get("/config/blacklist")
+def get_blacklist() -> dict:
+    """Blacklist effective (patterns titres, abréviations, entreprises)."""
+    return constants.get_blacklist()
+
+
+@app.put("/config/blacklist")
+def put_blacklist(body: dict[str, Any] = Body(...)) -> dict:
+    """Valide chaque regex, écrit config/blacklist.json, recharge.
+
+    Body : {"title_patterns": [...], "title_abbr": [...], "companies": [...]}.
+    """
+    try:
+        return constants.save_blacklist(
+            [str(p) for p in body.get("title_patterns", [])],
+            [str(a) for a in body.get("title_abbr", [])],
+            [str(c) for c in body.get("companies", [])],
+        )
+    except ValueError as e:
+        raise HTTPException(422, detail=str(e))
+
+
+# ---------- Diagnostics — tests de connexion (clés API, sources, prompt) ----------
+
+_TEST_SEARCH_TERM = "Technical Account Manager"
+_SOURCE_TEST_TIMEOUT_S = 90
+
+
+@app.post("/sources/{name}/test")
+async def test_source(name: str) -> dict:
+    """Sonde une source EN CONDITIONS RÉELLES : une mini-recherche (3 résultats max).
+
+    Vérifie credentials, connectivité et anti-bot d'un coup. Un `ok` avec 0
+    résultat signifie « joignable mais rien ne matche le terme de test » —
+    normal pour les sources à faible volume.
+    """
+    import time as _time
+    from connectors import get_connector
+
+    t0 = _time.monotonic()
+
+    def _done(ok: bool, records: int, detail: str, errors: list[str] | None = None) -> dict:
+        return {
+            "name": name, "ok": ok, "records": records, "detail": detail,
+            "errors": (errors or [])[:3],
+            "duration_s": round(_time.monotonic() - t0, 1),
+        }
+
+    try:
+        if name in app_settings.JOBSPY_SITES:
+            def _run_jobspy() -> int:
+                import jobspy_patch  # noqa: F401  (timeout Indeed 30s)
+                from jobspy import scrape_jobs
+                cfg = app_settings.get().search
+                df = scrape_jobs(
+                    site_name=[name], search_term=_TEST_SEARCH_TERM,
+                    # Google Jobs a son propre paramètre plein-texte (sinon 0 résultat).
+                    google_search_term=f"{_TEST_SEARCH_TERM} emplois {cfg.location}",
+                    location=cfg.location, results_wanted=3, hours_old=720,
+                    country_indeed=cfg.country, description_format="markdown", verbose=0,
+                )
+                return 0 if df is None else len(df)
+
+            count = await asyncio.wait_for(
+                asyncio.to_thread(_run_jobspy), timeout=_SOURCE_TEST_TIMEOUT_S,
+            )
+            return _done(count > 0, count,
+                         f"{count} offre(s) remontée(s) sur le terme de test"
+                         if count else "joignable mais 0 résultat (anti-bot possible)")
+
+        conn = get_connector(name)
+        if conn is None:
+            raise HTTPException(404, f"source inconnue : {name}")
+        if not conn.is_enabled():
+            return _done(False, 0, "désactivée — credentials/configuration manquants")
+
+        term = None if not getattr(conn, "uses_search_terms", True) else _TEST_SEARCH_TERM
+        res = await asyncio.wait_for(
+            conn.scrape(search_term=term, location="France", country="France",
+                        hours_old=720, results_wanted=3),
+            timeout=_SOURCE_TEST_TIMEOUT_S,
+        )
+        n = len(res.records)
+        if res.errors and not n:
+            return _done(False, 0, "échec — voir erreurs", res.errors)
+        return _done(True, n,
+                     f"{n} offre(s) remontée(s)" if n
+                     else "joignable, 0 résultat sur le terme de test",
+                     res.errors)
+    except HTTPException:
+        raise
+    except asyncio.TimeoutError:
+        return _done(False, 0, f"timeout après {_SOURCE_TEST_TIMEOUT_S}s")
+    except Exception as e:
+        return _done(False, 0, f"{type(e).__name__}: {e}")
+
+
+@app.post("/settings/secrets/test")
+async def test_secret(body: dict[str, Any] = Body(...)) -> dict:
+    """Vérifie qu'une clé fonctionne par un appel réel léger (aucune valeur renvoyée).
+
+    Body : {"name": "...", "value": "..."} — `value` absente = teste la clé
+    actuellement configurée (fichier ou .env). Pour France Travail, la PAIRE
+    id+secret est testée (l'autre moitié vient de la config courante).
+    Permet le workflow « tester AVANT d'enregistrer ».
+    """
+    import time as _time
+    import httpx
+
+    name = str(body.get("name", ""))
+    if name not in app_settings.SECRET_NAMES:
+        raise HTTPException(422, f"secret inconnu : {name}")
+    candidate = str(body.get("value") or "").strip() or None
+
+    def effective(n: str) -> str:
+        if n == name and candidate:
+            return candidate
+        return app_settings.get_secret(n)
+
+    t0 = _time.monotonic()
+
+    def _done(ok: bool, detail: str) -> dict:
+        return {"name": name, "ok": ok, "detail": detail,
+                "tested": "valeur candidate" if candidate else "valeur configurée",
+                "latency_ms": int((_time.monotonic() - t0) * 1000)}
+
+    async def _list_models(url: str, headers: dict, provider_label: str,
+                           provider_name: str) -> dict:
+        """Probe générique « liste des modèles » — vérifie aussi que le modèle
+        configuré pour ce provider existe bien chez lui."""
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(url, headers=headers)
+        if r.status_code != 200:
+            return _done(False, f"refusée par {provider_label} (HTTP {r.status_code})")
+        payload = r.json()
+        models = {m.get("id") or m.get("name", "") for m in payload.get("data", [])}
+        cfg = app_settings.get().llm.provider(provider_name)
+        extra = ""
+        if cfg and models and not any(cfg.model in m for m in models):
+            extra = f" — ⚠ le modèle configuré « {cfg.model} » n'est pas dans la liste"
+        return _done(True, f"valide — {len(models)} modèles accessibles{extra}")
+
+    try:
+        key = effective(name)
+
+        if name == "GROQ_API_KEY":
+            if not key:
+                return _done(False, "aucune clé à tester")
+            return await _list_models("https://api.groq.com/openai/v1/models",
+                                      {"Authorization": f"Bearer {key}"}, "Groq", "groq")
+
+        if name == "ANTHROPIC_API_KEY":
+            if not key:
+                return _done(False, "aucune clé à tester")
+            return await _list_models("https://api.anthropic.com/v1/models",
+                                      {"x-api-key": key, "anthropic-version": "2023-06-01"},
+                                      "Anthropic", "anthropic")
+
+        if name == "OPENAI_API_KEY":
+            if not key:
+                return _done(False, "aucune clé à tester")
+            return await _list_models("https://api.openai.com/v1/models",
+                                      {"Authorization": f"Bearer {key}"}, "OpenAI", "openai")
+
+        if name == "GEMINI_API_KEY":
+            if not key:
+                return _done(False, "aucune clé à tester")
+            return await _list_models(
+                "https://generativelanguage.googleapis.com/v1beta/openai/models",
+                {"Authorization": f"Bearer {key}"}, "Google Gemini", "google")
+
+        if name == "OPENROUTER_API_KEY":
+            if not key:
+                return _done(False, "aucune clé à tester")
+            async with httpx.AsyncClient(timeout=15) as c:
+                r = await c.get("https://openrouter.ai/api/v1/auth/key",
+                                headers={"Authorization": f"Bearer {key}"})
+            if r.status_code != 200:
+                return _done(False, f"refusée par OpenRouter (HTTP {r.status_code})")
+            data = r.json().get("data", {})
+            usage = data.get("usage")
+            limit = data.get("limit")
+            return _done(True, f"valide — usage {usage} / limite {limit if limit is not None else '∞'} $")
+
+        if name in ("WTTJ_ALGOLIA_APP_ID", "WTTJ_ALGOLIA_KEY"):
+            # Vraie requête Algolia (1 hit max) avec la paire effective.
+            from connectors import welcometothejungle as wttj
+            app_id = effective("WTTJ_ALGOLIA_APP_ID") or wttj._DEFAULT_APP_ID
+            api_key = effective("WTTJ_ALGOLIA_KEY") or wttj._DEFAULT_API_KEY
+            headers = dict(wttj.algolia_headers())
+            headers["x-algolia-application-id"] = app_id
+            headers["x-algolia-api-key"] = api_key
+            url = f"https://{app_id.lower()}-dsn.algolia.net/1/indexes/{wttj.JOBS_INDEX}/query"
+            async with httpx.AsyncClient(timeout=15) as c:
+                r = await c.post(url, headers=headers,
+                                 json={"query": _TEST_SEARCH_TERM, "hitsPerPage": 1})
+            if r.status_code != 200:
+                return _done(False, f"refusée par Algolia (HTTP {r.status_code})")
+            return _done(True, f"valide — {r.json().get('nbHits', '?')} hits sur le terme de test")
+
+        # France Travail : le token OAuth2 valide la PAIRE id+secret.
+        cid, cs = effective("FT_CLIENT_ID"), effective("FT_CLIENT_SECRET")
+        if not cid or not cs:
+            return _done(False, "il faut FT_CLIENT_ID ET FT_CLIENT_SECRET pour tester")
+        from connectors.francetravail import TOKEN_URL
+        scope = f"application_{cid} api_offresdemploiv2 o2dsoffre"
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post(
+                TOKEN_URL,
+                data={"grant_type": "client_credentials", "client_id": cid,
+                      "client_secret": cs, "scope": scope},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        if r.status_code != 200 or "access_token" not in r.json():
+            return _done(False, f"OAuth2 refusé (HTTP {r.status_code}) — "
+                                "régénérer les credentials sur francetravail.io ?")
+        return _done(True, "valide — token OAuth2 obtenu")
+    except Exception as e:
+        return _done(False, f"{type(e).__name__}: {e}")
+
+
+@app.get("/scoring/samples")
+def scoring_samples() -> dict:
+    """Offres fictives calibrées pour le banc d'essai du prompt."""
+    return {"samples": scoring.SAMPLE_JOBS}
+
+
+@app.post("/scoring/test")
+async def scoring_test(body: dict[str, Any] = Body(...)) -> dict:
+    """Note une offre fictive (jamais persistée), au choix avec un prompt candidat.
+
+    Body : {title, company, job_type, platform, description, prompt?}.
+    `prompt` présent = testé SANS être enregistré (validation avant mise en prod).
+    ⚠ Consomme un appel LLM réel (~3 200 tokens du quota Groq).
+    """
+    prompt_override = str(body.get("prompt") or "").strip() or None
+    if prompt_override and len(prompt_override) < 200:
+        raise HTTPException(422, "prompt candidat trop court (< 200 chars)")
+    fields = {k: body.get(k) for k in ("title", "company", "job_type", "platform", "description")}
+    if not str(fields.get("title") or "").strip():
+        raise HTTPException(422, "titre requis")
+    # 150 s < timeout du client webui (180 s) : l'appelant reçoit toujours ce
+    # message clair plutôt qu'un timeout réseau. Les deux providers en 429
+    # (quota Groq journalier + OpenRouter free saturé) mènent ici.
+    try:
+        return await asyncio.wait_for(
+            scoring.score_adhoc(fields, prompt_override), timeout=150,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(504, "les providers LLM ne répondent pas (quota journalier "
+                                 "Groq épuisé et fallback OpenRouter saturé ?) — "
+                                 "réessayer après le reset (~24 h)")
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
+
+
+@app.post("/rescore/recompute")
+def rescore_recompute() -> dict[str, int]:
+    """Recombine le score final depuis les composantes stockées — SANS appel LLM.
+
+    À utiliser après un changement de POIDS : base_score (LLM), score_geo,
+    score_salary et score_freshness sont déjà en base, seule la pondération
+    change. Instantané et gratuit, contrairement à /rescore?force=true qui
+    repasse chaque offre au modèle.
+    """
+    updated = 0
+    with get_session() as s:
+        jobs = s.query(Job).filter(Job.base_score.isnot(None)).all()
+        for job in jobs:
+            new_score = compute_final_score(
+                content=job.base_score,
+                geo=job.score_geo,
+                salary=job.score_salary,
+                freshness=job.score_freshness,
+            )
+            if new_score != job.relevance_score:
+                job.relevance_score = new_score
+                updated += 1
+    return {"scored": len(jobs) if jobs else 0, "updated": updated}
 
 
 @app.get("/logs", response_model=ScrapeLogsResponse)

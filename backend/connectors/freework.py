@@ -18,6 +18,7 @@ from urllib.parse import urlencode
 import httpx
 
 from .base import BaseConnector, ConnectorResult, JobRecord
+from .utils import cutoff_date
 # Note FR : BeautifulSoup a été retiré (jamais utilisé — le parsing va soit
 # vers l'API JSON interne /api/v1/jobs, soit vers un fallback re.findall sur le HTML).
 
@@ -83,7 +84,7 @@ class FreeWorkConnector(BaseConnector):
             return result
 
         html = r.text
-        cutoff = date.today() - timedelta(days=max(1, hours_old // 24))
+        cutoff = cutoff_date(hours_old)
 
         # Primary path: fetch the in-page API endpoint used by the SPA.
         # Free-Work exposes /api/v1/jobs which returns JSON.

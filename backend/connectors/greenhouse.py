@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 import httpx
 
 from .base import BaseConnector, ConnectorResult, JobRecord
+from .utils import cutoff_ts
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +36,9 @@ class GreenhouseConnector(BaseConnector):
         return bool(self._slugs())
 
     def _slugs(self) -> list[str]:
-        raw = os.getenv("GREENHOUSE_BOARDS", "") or ""
-        return [s.strip() for s in raw.split(",") if s.strip()]
+        # Page Paramètres > connecteurs (env GREENHOUSE_BOARDS = défaut au premier boot).
+        from settings import get
+        return list(get().connectors.greenhouse_boards)
 
     async def scrape(
         self,
@@ -54,7 +56,7 @@ class GreenhouseConnector(BaseConnector):
             return result
 
         # Fetch all boards in parallel; filter locally on title match with search_term.
-        cutoff = datetime.now(timezone.utc).timestamp() - hours_old * 3600
+        cutoff = cutoff_ts(hours_old)
         term_re = re.compile(re.escape(search_term), re.IGNORECASE)
 
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
@@ -88,6 +90,12 @@ class GreenhouseConnector(BaseConnector):
                             pass
 
                     loc = (j.get("location") or {}).get("name")
+                    # Filtre géo : les boards Greenhouse (Okta, Datadog…) sont
+                    # mondiaux. On ne garde que France + remote Europe/EMEA,
+                    # sinon des TAM NYC/Tokyo/Bengaluru polluent le profil France
+                    # (la region est ensuite forcée à FR par le profil de scrape).
+                    if not _location_targeted(loc):
+                        continue
                     rec: JobRecord = {
                         "site": self.platform_name,
                         "id": f"gh_{slug}_{j.get('id')}",
@@ -131,3 +139,38 @@ def _looks_remote(location: str | None) -> bool | None:
     if "remote" in lower or "anywhere" in lower:
         return True
     return None
+
+
+# Marqueurs de localisation France / Europe — un poste Greenhouse n'est conservé
+# que si sa location contient l'un d'eux (ou est un remote explicitement EU/EMEA).
+_FR_LOCATION_MARKERS: tuple[str, ...] = (
+    "france", "paris", "lyon", "marseille", "toulouse", "bordeaux", "lille",
+    "nantes", "strasbourg", "rennes", "nice", "grenoble", "sophia antipolis",
+    "île-de-france", "ile-de-france",
+)
+_EU_LOCATION_MARKERS: tuple[str, ...] = (
+    "emea", "europe", "european union", " eu ",
+    "united kingdom", "london", "ireland", "dublin",
+    "germany", "berlin", "munich", "frankfurt",
+    "netherlands", "amsterdam", "belgium", "brussels",
+    "spain", "madrid", "barcelona", "italy", "milan", "rome",
+    "switzerland", "zurich", "geneva", "luxembourg",
+    "portugal", "lisbon", "poland", "warsaw", "sweden", "stockholm",
+)
+
+
+def _location_targeted(location: str | None) -> bool:
+    """True si la location vaut la peine d'être stockée pour le profil France.
+
+    Garde France + remote Europe/EMEA. Rejette le reste (US, Canada, APAC,
+    LATAM…). Une location absente est rejetée : les boards Greenhouse exposent
+    presque toujours une localisation, donc l'absence est suspecte.
+    """
+    if not location:
+        return False
+    lower = " " + location.lower() + " "
+    if any(m in lower for m in _FR_LOCATION_MARKERS):
+        return True
+    if any(m in lower for m in _EU_LOCATION_MARKERS):
+        return True
+    return False

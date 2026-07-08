@@ -5,7 +5,7 @@ titre/description et renvoient une classification best-effort. En cas d'ambiguï
 on retourne None plutôt que de deviner.
 
 Composantes de scoring (Phase 4) :
-  compute_geo_score()       — accessibilité géographique depuis ta localisation (à calibrer dans compute_geo_score)
+  compute_geo_score()       — accessibilité géographique depuis l'origine configurée (config/geo_scope.json)
   compute_salary_score()    — salaire annualisé EUR vs. seuils de seniorité
   compute_freshness_score() — décroissance temporelle depuis la date de publication
   compute_final_score()     — combinaison pondérée des 4 axes (incluant le score Claude)
@@ -13,7 +13,7 @@ Composantes de scoring (Phase 4) :
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import date, datetime
 from typing import Literal, Optional
 
 WorkMode = Literal["full_remote", "hybrid", "onsite"]
@@ -91,11 +91,20 @@ _DE_MARKERS = {
     "netzwerk", "verantwortlich", "erfahrung", "unternehmen",
 }
 
+_NL_MARKERS = {
+    "de", "het", "een", "en", "voor", "met", "van", "je", "jij", "wij",
+    "veiligheid", "netwerk", "ervaring", "bedrijf", "functie", "werken",
+    "verantwoordelijk", "kennis", "vaardigheden", "klant", "team",
+    "beveiliging", "beveiligingsconsultant", "veiligheid", "preventieadviseur",
+    "vast", "noordoost", "brussel", "aantrekkelijk", "salaris", "bedrijfswagen",
+    "technisch", "directeur",
+}
+
 _WORD_RE = re.compile(r"\b[\w']+\b", re.UNICODE)
 
 
 def detect_language(text: Optional[str]) -> Optional[str]:
-    """Return 'fr' / 'en' / 'de' / None. Looks at the first ~200 tokens."""
+    """Return 'fr' / 'en' / 'de' / 'nl' / None. Looks at the first ~200 tokens."""
     if not text:
         return None
     tokens = _WORD_RE.findall(text.lower())[:200]
@@ -104,10 +113,11 @@ def detect_language(text: Optional[str]) -> Optional[str]:
     fr = sum(1 for t in tokens if t in _FR_MARKERS)
     en = sum(1 for t in tokens if t in _EN_MARKERS)
     de = sum(1 for t in tokens if t in _DE_MARKERS)
-    total_hits = fr + en + de
-    if total_hits < 3:
+    nl = sum(1 for t in tokens if t in _NL_MARKERS)
+    total_hits = fr + en + de + nl
+    if total_hits < 2:
         return None
-    ranked = sorted([("fr", fr), ("en", en), ("de", de)], key=lambda x: x[1], reverse=True)
+    ranked = sorted([("fr", fr), ("en", en), ("de", de), ("nl", nl)], key=lambda x: x[1], reverse=True)
     top, second = ranked[0], ranked[1]
     if top[1] >= max(3, second[1] * 1.2):
         return top[0]
@@ -115,11 +125,8 @@ def detect_language(text: Optional[str]) -> Optional[str]:
 
 
 # ============================================================
-# Geographic scoring — calibrate compute_geo_score() to YOUR home location
+# Geographic scoring — origin configured in config/geo_scope.json
 # ============================================================
-# La grille ci-dessous est calibrée pour quelqu'un qui considère Paris/IDF comme
-# "accessible". Adapte _PARIS_RE et compute_geo_score() à ta propre situation
-# géographique (ville d'origine, distance acceptable, etc.).
 
 # Paris / Île-de-France location patterns (dept numbers, major cities)
 _PARIS_RE = re.compile(
@@ -164,7 +171,7 @@ def compute_geo_score(
     location: Optional[str],
     description: Optional[str] = None,
 ) -> float:
-    """Geographic accessibility score (0-10) from your home location (calibrate in compute_geo_score).
+    """Geographic accessibility score (0-10) from the configured origin (config/geo_scope.json).
 
     Priority ladder (descending):
         full_remote (10) > hybrid high-ratio (9) > hybrid Paris (8) >
@@ -273,23 +280,46 @@ def compute_salary_score(
 # Freshness scoring
 # ============================================================
 
-def compute_freshness_score(date_posted: Optional[date | str]) -> float:
+def _coerce_date(value: Optional[date | datetime | str]) -> Optional[date]:
+    """Normalise date / datetime / string ISO → date, ou None si inexploitable.
+
+    Gère les strings de date pure ("2026-04-21") comme de datetime
+    ("2026-04-21T21:59:55") en ne gardant que les 10 premiers caractères.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):   # datetime est sous-classe de date → traiter en 1er
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value[:10])
+        except ValueError:
+            return None
+    return None
+
+
+def compute_freshness_score(
+    date_posted: Optional[date | datetime | str],
+    fallback: Optional[date | datetime | str] = None,
+) -> float:
     """Score 0-10 par décroissance temporelle depuis aujourd'hui.
 
-    Retourne 5.0 (neutre) si la date de publication est inconnue.
-    Accepte aussi une date ISO sous forme de string (certains connecteurs en passent).
+    Utilise `date_posted`. Si elle est absente (connecteurs linkedin / cadremploi
+    / hellowork / freework qui ne la fournissent jamais), retombe sur `fallback`
+    — typiquement `scraped_at`, la date de découverte — au lieu de geler à 5.0.
+    Sinon une offre sans date ne vieillirait jamais et squatterait le haut du
+    classement. Retourne 5.0 (neutre) seulement si aucune des deux n'est exploitable.
+    Accepte date, datetime ou string ISO (date ou datetime).
     """
-    if date_posted is None:
+    d = _coerce_date(date_posted)
+    if d is None:
+        d = _coerce_date(fallback)
+    if d is None:
         return 5.0
 
-    # Tolérance string : convertit "2026-04-21" → date
-    if isinstance(date_posted, str):
-        try:
-            date_posted = date.fromisoformat(date_posted)
-        except (ValueError, AttributeError):
-            return 5.0
-
-    age_days = (date.today() - date_posted).days
+    age_days = (date.today() - d).days
     if age_days < 0:    return 10.0  # date future (artefact TZ) → considérée comme neuve
     if age_days <= 2:   return 10.0
     if age_days <= 6:   return 9.0
@@ -303,12 +333,16 @@ def compute_freshness_score(date_posted: Optional[date | str]) -> float:
 # Weighted final score
 # ============================================================
 
-# Must sum to 1.0.
-_W_CONTENT:     float = 0.30   # Claude: role relevance + company quality + description richness
-_W_GEO:         float = 0.30   # Geographic accessibility from your home location
-_W_SALARY:      float = 0.20   # Salary competitiveness (annualised EUR)
-_W_FRESHNESS:   float = 0.15   # Posting freshness (temporal decay)
-_W_COMPETITION: float = 0.05   # Competition level (defaults to neutral 5.0)
+# Les poids vivent dans settings (config/settings.json, éditables via la page
+# Paramètres, somme = 1.0). Défauts rééquilibrés 2026-06-08 : contenu dominant —
+# la note LLM pilote le classement, géo/salaire/fraîcheur ne font que moduler.
+# Import paresseux : enrichment est aussi importé hors backend (claude_score.py).
+
+def _weights() -> tuple[float, float, float, float, float]:
+    """(content, geo, salary, freshness, competition) depuis la config courante."""
+    from settings import get
+    w = get().weights
+    return w.content, w.geo, w.salary, w.freshness, w.competition
 
 
 def compute_final_score(
@@ -324,23 +358,30 @@ def compute_final_score(
 
     Fallback neutrals when a component is missing:
         geo        → 5.0 (neutral)
-        salary     → 4.0 (slight negative: no info)
+        salary     → 5.0 (neutral: pas de salaire affiché ne doit pas pénaliser)
         freshness  → 5.0 (neutral)
         competition→ 5.0 (neutral — rarely available)
     """
     if content is None:
         return None
 
+    w_content, w_geo, w_salary, w_freshness, w_competition = _weights()
+
     c  = float(content)
     g  = float(geo)        if geo        is not None else 5.0
-    sa = float(salary)     if salary     is not None else 4.0
+    sa = float(salary)     if salary     is not None else 5.0
     fr = float(freshness)  if freshness  is not None else 5.0
 
     raw = (
-        c  * _W_CONTENT     +
-        g  * _W_GEO         +
-        sa * _W_SALARY      +
-        fr * _W_FRESHNESS   +
-        competition * _W_COMPETITION
+        c  * w_content     +
+        g  * w_geo         +
+        sa * w_salary      +
+        fr * w_freshness   +
+        competition * w_competition
     )
-    return round(min(10.0, max(0.0, raw)), 2)
+    final = round(min(10.0, max(0.0, raw)), 2)
+    # A hard content rejection must stay a rejection. Otherwise a fresh/remote job
+    # with salary data can climb above 5 despite being off-profile.
+    if c <= 2.0:
+        return min(final, 3.0)
+    return final

@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}pipeline{% endblock %}
+{% block content %}
+<div class="phead"><span class="mk">&gt;pds</span><h1>pipeline</h1>
+  <span class="meta">kanban · drag &amp; drop</span></div>
+<div class="prompt">clique une carte pour le détail · glisse-la d'une colonne à l'autre pour changer son statut</div>
+
+<style>
+.kc{cursor:pointer}
+.kc:hover{border-color:var(--green,#3fb950)}
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.66);display:none;
+  align-items:flex-start;justify-content:center;z-index:1000;overflow:auto;padding:40px 16px}
+.modal-bg.open{display:flex}
+.modal-box{position:relative;width:100%;max-width:760px;max-height:90vh;overflow:auto}
+.modal-x{position:absolute;top:6px;right:8px;z-index:3;background:var(--bg2,#161b22);
+  border:1px solid var(--border,#30363d);border-radius:var(--r-sm,6px);color:var(--txt2,#9aa);
+  font-size:.9rem;line-height:1;padding:4px 9px;cursor:pointer}
+.modal-x:hover{color:var(--txt,#eee)}
+</style>
+
+<div id="board" hx-get="/pipeline/board" hx-trigger="load" hx-swap="innerHTML">
+  <div class="of-empty">chargement du pipeline…</div>
+</div>
+
+<div class="modal-bg" id="kc-modal" aria-hidden="true">
+  <div class="modal-box">
+    <button class="modal-x" id="kc-close" title="fermer (Échap)">✕ fermer</button>
+    <div id="of-detail"><div class="of-empty">chargement…</div></div>
+  </div>
+</div>
+
+<script>
+/* Drag & drop natif HTML5 ; le drop POST le nouveau statut et recharge le board. */
+let dragId = null;
+document.body.addEventListener('dragstart', e => {
+  const card = e.target.closest('.kc[data-id]');
+  if (!card) return;
+  dragId = card.dataset.id;
+  card.classList.add('dragging');
+  e.dataTransfer.effectAllowed = 'move';
+});
+document.body.addEventListener('dragend', e => {
+  e.target.closest?.('.kc')?.classList.remove('dragging');
+});
+document.body.addEventListener('dragover', e => {
+  const col = e.target.closest('.kcol[data-status]');
+  if (!col) return;
+  e.preventDefault();
+  col.classList.add('dragover');
+});
+document.body.addEventListener('dragleave', e => {
+  e.target.closest?.('.kcol')?.classList.remove('dragover');
+});
+document.body.addEventListener('drop', async e => {
+  const col = e.target.closest('.kcol[data-status]');
+  if (!col || !dragId) return;
+  e.preventDefault();
+  col.classList.remove('dragover');
+  const body = new URLSearchParams({ job_id: dragId, status: col.dataset.status });
+  const r = await fetch('/pipeline/move', { method: 'POST', body });
+  document.getElementById('board').innerHTML = await r.text();
+  htmx.process(document.getElementById('board'));
+  dragId = null;
+});
+
+/* ---- Clic sur une carte -> ouvre le detail en modale (reutilise /offres/detail) ---- */
+const kcModal = document.getElementById('kc-modal');
+let justDragged = false;
+document.body.addEventListener('dragend', () => { justDragged = true; setTimeout(() => { justDragged = false; }, 150); });
+
+function openCard(id){
+  const det = document.getElementById('of-detail');
+  det.innerHTML = '<div class="of-empty">chargement…</div>';
+  kcModal.classList.add('open'); kcModal.setAttribute('aria-hidden', 'false');
+  htmx.ajax('GET', '/offres/detail/' + id, { target: '#of-detail', swap: 'innerHTML' });
+}
+function closeCard(){
+  if (!kcModal.classList.contains('open')) return;
+  kcModal.classList.remove('open'); kcModal.setAttribute('aria-hidden', 'true');
+  document.getElementById('of-detail').innerHTML = '';
+  /* recharge le board pour refleter un eventuel changement de statut fait dans la modale */
+  fetch('/pipeline/board').then(r => r.text()).then(h => {
+    const b = document.getElementById('board'); b.innerHTML = h; htmx.process(b);
+  });
+}
+document.body.addEventListener('click', e => {
+  if (e.target.closest('#kc-modal')) return;                          /* clics dans la modale : geres a part */
+  if (e.target.closest('button, a, select, textarea, input')) return; /* ignore les controles (croix, etc.) */
+  if (justDragged) return;                                            /* fin de drag, pas un clic */
+  const card = e.target.closest('.kc[data-id]');
+  if (card) openCard(card.dataset.id);
+});
+document.getElementById('kc-close').addEventListener('click', closeCard);
+kcModal.addEventListener('click', e => { if (e.target === kcModal) closeCard(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeCard(); });
+</script>
+{% endblock %}

@@ -26,7 +26,9 @@ logger = logging.getLogger(__name__)
 
 
 def is_playwright_enabled() -> bool:
-    return os.getenv("PLAYWRIGHT_ENABLED", "false").lower() in ("true", "1", "yes")
+    # Page Paramètres > connecteurs (env PLAYWRIGHT_ENABLED = défaut au premier boot).
+    from settings import get
+    return get().connectors.playwright_enabled
 
 
 _USER_AGENT = (

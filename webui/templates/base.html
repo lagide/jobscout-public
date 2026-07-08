@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}jobscout{% endblock %} — pds</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/theme.css">
+<script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.4/dist/htmx.min.js"></script>
+</head>
+<body>
+<aside class="sidebar">
+  <div class="brand"><span class="mk">&gt;pds</span><span class="nm">jobscout</span>
+    {% if request.state.readonly %}<span class="tag tag--cyan" style="margin-left:auto">lecture</span>{% endif %}
+  </div>
+  <nav class="nav">
+    <a href="/cockpit"  class="{{ 'active' if path.startswith('/cockpit') }}"><span class="g">▣</span><span class="lbl">Cockpit</span></a>
+    <a href="/offres"   class="{{ 'active' if path.startswith('/offres') }}"><span class="g">≡</span><span class="lbl">Offres</span></a>
+    <a href="/triage"   class="{{ 'active' if path.startswith('/triage') }}"><span class="g">▤</span><span class="lbl">Triage</span></a>
+    {% if not request.state.readonly %}
+    <a href="/pipeline" class="{{ 'active' if path.startswith('/pipeline') }}"><span class="g">▥</span><span class="lbl">Pipeline</span></a>
+    {% endif %}
+    <a href="/insights" class="{{ 'active' if path.startswith('/insights') }}"><span class="g">◔</span><span class="lbl">Insights</span></a>
+    {% if not request.state.readonly %}
+    <a href="/systeme"  class="{{ 'active' if path.startswith('/systeme') }}"><span class="g">⚙</span><span class="lbl">Système</span></a>
+    <a href="/parametres" class="{{ 'active' if path.startswith('/parametres') }}"><span class="g">✎</span><span class="lbl">Paramètres</span></a>
+    {% endif %}
+  </nav>
+  <div class="sysblock">
+    <div class="t">SYSTEM</div>
+    {% if sys_stats %}
+    <div class="kv"><span class="k">BACKEND</span><span><span class="online"></span>online</span></div>
+    <div class="kv"><span class="k">INDEXED</span><span>{{ sys_stats.total_jobs }}</span></div>
+    <div class="kv"><span class="k">SCORED</span><span>{{ sys_stats.scored }}/{{ sys_stats.total_jobs }}</span></div>
+    {% else %}
+    <div class="kv"><span class="k">BACKEND</span><span style="color:var(--red)">offline</span></div>
+    {% endif %}
+  </div>
+</aside>
+<main>
+{% block content %}{% endblock %}
+</main>
+<script type="module" src="/static/motion.js"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

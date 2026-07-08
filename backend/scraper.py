@@ -32,8 +32,9 @@ from typing import Any, Optional
 
 import pandas as pd
 
+import settings as app_settings
 from connectors import get_connector, registered_platforms
-from constants import GEO_PROFILES, is_title_blacklisted
+from constants import GEO_PROFILES, is_company_blacklisted, is_title_blacklisted
 from currency import compute_effective_eur, to_eur
 from database import get_session
 from enrichment import (
@@ -43,6 +44,8 @@ from enrichment import (
     detect_language,
     detect_work_mode,
 )
+from geo_scope import is_location_in_scope
+from job_urls import clean_http_url, select_job_urls
 from models import Job, ScrapeLog
 from schemas import SearchRequest, SearchResponse
 
@@ -137,10 +140,11 @@ def compute_content_hash(
 
 def _row_to_job_kwargs(row: pd.Series) -> dict[str, Any]:
     """Mappe une ligne (DataFrame JobSpy ou dict connecteur) vers les kwargs du modèle Job."""
+    canonical_url, _alternatives = select_job_urls(row)
     return {
         "external_id": _nan_to_none(row.get("id")),
         "platform": str(row.get("site", "unknown")),
-        "job_url": str(row.get("job_url") or row.get("job_url_direct") or ""),
+        "job_url": canonical_url,
         "title": str(_nan_to_none(row.get("title")) or "Unknown title"),
         "company": _nan_to_none(row.get("company")),
         "location": _nan_to_none(row.get("location")),
@@ -178,9 +182,14 @@ def _resolve_profile(req: SearchRequest) -> tuple[str, str, Optional[str], Optio
     permettent toutefois un appel ad-hoc sans profil.
     """
     profile = GEO_PROFILES.get(req.profile) if req.profile else None
+    search_cfg = app_settings.get().search
 
-    location = req.location or (profile["location"] if profile else "France")
-    country = req.country or (profile["country"] if profile else "France")
+    # Précédence : override direct de la requête > localisation configurée
+    # (settings.search, page Paramètres) > profil GEO_PROFILES codé.
+    location = req.location or search_cfg.location \
+        or (profile["location"] if profile else "France")
+    country = req.country or search_cfg.country \
+        or (profile["country"] if profile else "France")
     profile_name = req.profile if profile else None
     region = profile["region"] if profile else None
 
@@ -208,6 +217,10 @@ def _scrape_jobspy_sync(
             df = scrape_jobs(
                 site_name=jobspy_sites,
                 search_term=term,
+                # Google Jobs ignore search_term/location : il a son propre
+                # paramètre plein-texte. Sans lui, google renvoie TOUJOURS 0
+                # résultat (bug historique corrigé 2026-07-02).
+                google_search_term=f"{term} emplois {location}",
                 location=location,
                 results_wanted=req.results_per_term,
                 hours_old=req.hours_old,
@@ -226,12 +239,20 @@ def _scrape_jobspy_sync(
 async def _scrape_connectors(
     req: SearchRequest, location: str, country: str, connector_names: list[str]
 ) -> tuple[list[pd.DataFrame], list[str]]:
-    """Tourne tous les connecteurs custom activés, un par terme de recherche."""
+    """Tourne les connecteurs custom activés.
+
+    Deux familles :
+    - keyword (uses_search_terms=True) : appelés une fois par terme de recherche libre.
+    - structuré (uses_search_terms=False) : appelés une seule fois par profil
+      (search_term=None) ; ils construisent eux-mêmes leur requête depuis des
+      filtres (codes ROME, qualification, départements…).
+    """
     frames: list[pd.DataFrame] = []
     term_errors: list[str] = []
 
     # On filtre sur les connecteurs présents dans le registry ET activés (creds OK)
-    usable: list[tuple[str, object]] = []
+    keyword_conns: list[tuple[str, object]] = []
+    structured_conns: list[tuple[str, object]] = []
     for name in connector_names:
         conn = get_connector(name)
         if conn is None:
@@ -240,13 +261,37 @@ async def _scrape_connectors(
         if not conn.is_enabled():
             term_errors.append(f"[{name}] disabled (missing credentials)")
             continue
-        usable.append((name, conn))
+        if getattr(conn, "uses_search_terms", True):
+            keyword_conns.append((name, conn))
+        else:
+            structured_conns.append((name, conn))
 
-    if not usable:
-        return frames, term_errors
+    # Connecteurs structurés : un seul appel par profil, sans texte libre.
+    # results_wanted élargi (sur tous les termes) car ce connector ne boucle pas.
+    structured_results_wanted = max(
+        req.results_per_term,
+        req.results_per_term * max(1, len(req.search_terms)),
+    )
+    for name, conn in structured_conns:
+        try:
+            logger.info("Connector %s (structured, term-agnostic)", name)
+            res = await conn.scrape(
+                search_term=None,
+                location=location,
+                country=country,
+                hours_old=req.hours_old,
+                results_wanted=structured_results_wanted,
+            )
+            term_errors.extend(res.errors)
+            if res.records:
+                frames.append(pd.DataFrame(res.records))
+        except Exception as e:
+            term_errors.append(f"[{name}] {type(e).__name__}: {e}")
+            logger.exception("Structured connector %s failed", name)
 
+    # Connecteurs keyword : un appel par terme de recherche.
     for term in req.search_terms:
-        for name, conn in usable:
+        for name, conn in keyword_conns:
             try:
                 logger.info("Connector %s term=%r", name, term)
                 res = await conn.scrape(
@@ -332,8 +377,9 @@ async def scrape_and_store(
             # Avant : 2 SELECT par offre (lookup URL + lookup hash) → 2N queries.
             # Maintenant : 2 SELECT au total + lookups O(1) sur set/dict en mémoire.
             with get_session() as s:
-                existing_urls: set[tuple[str, str]] = {
-                    (p, u) for p, u in s.query(Job.platform, Job.job_url).all()
+                # Map (platform, url) → job_id pour pouvoir bumper last_seen_at sur dups
+                existing_url_to_id: dict[tuple[str, str], int] = {
+                    (p, u): jid for p, u, jid in s.query(Job.platform, Job.job_url, Job.id).all()
                 }
                 # Map content_hash → job_id (suffit pour aller chercher la ligne en SELECT direct)
                 existing_hashes: dict[str, int] = dict(
@@ -341,6 +387,9 @@ async def scrape_and_store(
                     .filter(Job.content_hash.isnot(None))
                     .all()
                 )
+
+            # Collecte les ids vus pendant ce scrape (dups + merges) pour bumper last_seen_at en bulk
+            seen_ids: set[int] = set()
 
             with get_session() as s:
                 for _, row in combined.iterrows():
@@ -352,14 +401,34 @@ async def scrape_and_store(
                         # Filtre blacklist : titres non pertinents (sales, alternance,
                         # technicien, support N1/N2…). Skip immédiat avant tout : on ne
                         # paye ni la DB ni un éventuel appel OpenRouter.
-                        if is_title_blacklisted(kwargs["title"]):
+                        if is_title_blacklisted(kwargs["title"]) or is_company_blacklisted(kwargs["company"]):
                             blacklisted_count += 1
                             continue
 
+                        # Le remote intégral reste national. Tout hybride/présentiel
+                        # doit être dans le périmètre défini par config/geo_scope.json.
+                        # Désactivable via settings.search.geo_filter_enabled (page
+                        # Paramètres) quand on élargit la zone de recherche.
+                        work_mode = detect_work_mode(
+                            kwargs.get("description"), kwargs.get("is_remote")
+                        )
+                        if app_settings.get().search.geo_filter_enabled:
+                            in_scope, scope_reason = is_location_in_scope(
+                                kwargs.get("location"), work_mode, kwargs.get("is_remote")
+                            )
+                            if not in_scope:
+                                blacklisted_count += 1
+                                logger.debug(
+                                    "Geo scope rejected title=%r location=%r reason=%s",
+                                    kwargs.get("title"), kwargs.get("location"), scope_reason,
+                                )
+                                continue
+
                         # Garde (platform, job_url) — même URL revue sur la même plateforme
                         url_key = (kwargs["platform"], kwargs["job_url"])
-                        if url_key in existing_urls:
+                        if url_key in existing_url_to_id:
                             dup_count += 1
+                            seen_ids.add(existing_url_to_id[url_key])
                             continue
 
                         # Hash de contenu pour dédoublonnage cross-plateforme
@@ -367,11 +436,15 @@ async def scrape_and_store(
                             kwargs["title"], kwargs["company"], kwargs["location"]
                         )
 
-                        source_entry = {
-                            "platform": kwargs["platform"],
-                            "url": kwargs["job_url"],
-                            "scraped_at": _utcnow().isoformat(),
-                        }
+                        _canonical, source_urls = select_job_urls(row)
+                        source_entries = [
+                            {
+                                "platform": kwargs["platform"],
+                                "url": source_url,
+                                "scraped_at": _utcnow().isoformat(),
+                            }
+                            for source_url in source_urls
+                        ]
 
                         # Cas : même offre déjà connue sur une autre plateforme
                         # → on enrichit son champ `sources`, pas de nouvelle ligne.
@@ -379,19 +452,31 @@ async def scrape_and_store(
                         if existing_id is not None:
                             existing_job = s.get(Job, existing_id)
                             if existing_job is not None:
-                                existing_job.sources = _sources_append(
-                                    existing_job.sources, source_entry
-                                )
+                                for source_entry in source_entries:
+                                    existing_job.sources = _sources_append(
+                                        existing_job.sources, source_entry
+                                    )
+                                # Pour Indeed, promouvoir le lien direct employeur :
+                                # le bouton de candidature ne dépend plus du jk éphémère.
+                                direct_url = clean_http_url(row.get("job_url_direct"))
+                                if kwargs["platform"] == "indeed" and direct_url:
+                                    existing_job.job_url = direct_url
                                 merged_count += 1
+                                seen_ids.add(existing_id)
                                 # On ajoute aussi au set en mémoire pour les itérations suivantes
-                                existing_urls.add(url_key)
+                                existing_url_to_id[url_key] = existing_id
                                 continue
 
                         # Enrichissement : mode de travail, langue, conversion EUR.
-                        work_mode = detect_work_mode(
-                            kwargs.get("description"), kwargs.get("is_remote")
-                        )
-                        language = detect_language(kwargs.get("description"))
+                        # Pour Suisse / Luxembourg / Belgique, on rejette ? l'ingestion les
+                        # offres clairement non FR/EN (allemand, n?erlandais...). Les titres
+                        # trop courts restent language=None et sont conserv?s pour ?viter les
+                        # faux n?gatifs sur des intitul?s anglais sans description.
+                        lang_text = f"{kwargs.get('title') or ''}\n{kwargs.get('description') or ''}"
+                        language = detect_language(lang_text)
+                        if profile_name in {"Suisse", "Luxembourg", "Belgique"} and language not in (None, "fr", "en"):
+                            blacklisted_count += 1
+                            continue
 
                         sal_min_eur = to_eur(kwargs.get("min_salary"), kwargs.get("currency"))
                         sal_max_eur = to_eur(kwargs.get("max_salary"), kwargs.get("currency"))
@@ -411,13 +496,17 @@ async def scrape_and_store(
                         sc_salary = compute_salary_score(
                             sal_min_eur, sal_max_eur, kwargs.get("salary_interval")
                         )
-                        sc_freshness = compute_freshness_score(kwargs.get("date_posted"))
+                        # Repli sur la date de découverte (= maintenant) quand le
+                        # connecteur ne fournit pas date_posted (linkedin, cadremploi…).
+                        sc_freshness = compute_freshness_score(
+                            kwargs.get("date_posted"), fallback=_utcnow()
+                        )
 
                         # Insertion d'une vraie nouvelle offre
                         job = Job(
                             **kwargs,
                             content_hash=c_hash,
-                            sources=json.dumps([source_entry]),
+                            sources=json.dumps(source_entries),
                             geo_profile=profile_name,
                             region=region,
                             work_mode=work_mode,
@@ -437,10 +526,18 @@ async def scrape_and_store(
                         # On met à jour les index en mémoire pour que les itérations
                         # suivantes voient cette ligne comme déjà existante (cas où
                         # le même hash apparaîtrait deux fois dans le même batch).
-                        existing_urls.add(url_key)
+                        existing_url_to_id[url_key] = job.id
                         existing_hashes[c_hash] = job.id
                     except Exception as e:
                         errors.append(f"{row.get('job_url', '?')}: {type(e).__name__}: {e}")
+
+                # Bulk UPDATE last_seen_at sur tous les jobs revus pendant ce scrape.
+                # Un seul UPDATE évite N queries (vital sur 1000+ dups par cycle).
+                if seen_ids:
+                    s.query(Job).filter(Job.id.in_(seen_ids)).update(
+                        {Job.last_seen_at: _utcnow()},
+                        synchronize_session=False,
+                    )
 
         # Lance le scoring en fire-and-forget (n'attend pas la fin)
         if req.score_new_jobs and new_ids:

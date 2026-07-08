@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}système{% endblock %}
+{% block content %}
+<div class="phead"><span class="mk">&gt;pds</span><h1>système</h1>
+  <span class="meta">ops · logs</span></div>
+<div class="prompt">santé, opérations sensibles, journal des scrapes</div>
+
+{% if backend_error %}<div class="alert alert--err">backend injoignable : {{ backend_error }}</div>{% endif %}
+
+<div class="grid2">
+  <div class="card"><div class="card__h"><div class="dots"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i></div>
+    <span class="card__t">health.json</span></div>
+    <div class="card__b">
+      <div class="kv"><span class="k">STATUS</span><span>{{ (h.status if h else '?')|upper }}</span></div>
+      <div class="kv"><span class="k">BACKEND TIME</span><span>{{ h.time[:19] if h else '—' }}</span></div>
+      <div class="kv"><span class="k">DB SIZE</span><span>{{ hdb.db_mb or '—' }} Mo</span></div>
+      <div class="kv"><span class="k">DB WAL</span><span>{{ hdb.wal_bytes or 0 }} octets</span></div>
+      <div class="kv"><span class="k">JOBS TOTAL</span><span>{{ hdb.jobs_total or '—' }}</span></div>
+      <div class="kv"><span class="k">ARCHIVÉES</span><span>{{ hdb.jobs_archived or 0 }}</span></div>
+      <div class="kv"><span class="k">EN PIPELINE</span><span>{{ hdb.jobs_applied or 0 }}</span></div>
+      <div class="kv"><span class="k">LOGS CONSERVÉS</span><span>{{ hdb.scrape_logs_total or 0 }}</span></div>
+    </div>
+  </div>
+  <div class="card"><div class="card__h"><div class="dots"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i></div>
+    <span class="card__t">ops_actions.sh</span></div>
+    <div class="card__b">
+      <div id="ops-fb"></div>
+      <button style="width:100%;margin-bottom:8px"
+        hx-post="/ops/rescore" hx-target="#ops-fb">▸ rescore manquants seulement <span class="htmx-indicator">…</span></button>
+      <button style="width:100%;margin-bottom:8px"
+        hx-post="/ops/rescore?force=true" hx-target="#ops-fb"
+        hx-confirm="Rescore TOUT (force) : tous les scores actuels seront effacés et recalculés. Confirmer ?">
+        ▸ rescore TOUT (force) ⚠️ <span class="htmx-indicator">…</span></button>
+      <button style="width:100%"
+        hx-post="/ops/config-reload" hx-target="#ops-fb">▸ recharger la config chaude (blacklist + prompt) <span class="htmx-indicator">…</span></button>
+    </div>
+  </div>
+</div>
+
+<div class="card"><div class="card__h"><div class="dots"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i></div>
+  <span class="card__t">scrape_logs.tail</span></div>
+  <div style="overflow-x:auto">
+  <table class="tri">
+    <thead><tr><th>démarré</th><th>statut</th><th>profil</th><th>par</th>
+      <th>scrapées</th><th>nouvelles</th><th>doublons</th><th>merged</th><th>blacklist</th></tr></thead>
+    <tbody>
+    {% for l in logs %}
+    <tr class="anim-li">
+      <td>{{ l.started_at[:19] if l.started_at }}</td>
+      <td><span style="color:{{ 'var(--green)' if l.status=='success' else 'var(--red)' if l.status=='failed' else 'var(--yellow)' }}">{{ l.status }}</span></td>
+      <td>{{ l.profile or '—' }}</td><td>{{ l.triggered_by or '—' }}</td>
+      <td>{{ l.scraped }}</td><td>{{ l.new_jobs }}</td><td>{{ l.duplicates }}</td>
+      <td>{{ l.merged_sources }}</td><td>{{ l.blacklisted }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="9" style="text-align:center;color:var(--dim);padding:24px">aucun log</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+
+{% if logs_errors %}
+<div class="card__t" style="margin:14px 0 8px">{{ logs_errors|length }} run(s) avec erreurs</div>
+<div class="loglist">
+  {% for l in logs_errors %}
+  <details>
+    <summary>⚠️ {{ l.started_at[:19] if l.started_at }} · {{ l.profile or '?' }}</summary>
+    <div class="body">
+      {% if l.fatal_error %}<div class="alert alert--err">{{ l.fatal_error }}</div>{% endif %}
+      {% for err in (l.errors or [])[:20] %}<div class="alert alert--warn">{{ err }}</div>{% endfor %}
+    </div>
+  </details>
+  {% endfor %}
+</div>
+{% endif %}
+{% endblock %}

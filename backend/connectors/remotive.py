@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import httpx
 
 from .base import BaseConnector, ConnectorResult, JobRecord
+from .utils import cutoff_ts
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,7 @@ class RemotiveConnector(BaseConnector):
             return result
 
         jobs = payload.get("jobs", []) or []
-        cutoff = datetime.now(timezone.utc).timestamp() - hours_old * 3600
+        cutoff = cutoff_ts(hours_old)
 
         for j in jobs[: results_wanted * 2]:  # cap further
             try:

@@ -6,45 +6,57 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from constants import DEFAULT_PROFILE, SEARCH_TERMS
+import settings as app_settings
+from constants import DEFAULT_PROFILE
 
 Platform = Literal[
     # JobSpy-native
     "linkedin", "indeed", "glassdoor", "zip_recruiter", "google",
     # Custom connectors
     "remotive", "francetravail", "freework", "himalayas", "greenhouse", "workday",
-    "apec",
+    "apec", "wttj", "hellowork", "cadremploi",
+    "choisirservicepublic",
 ]
 
 
 # ---------- API request/response ----------
 
 class SearchRequest(BaseModel):
-    """POST /search body. Defaults target the senior IT/cybersecurity rubric."""
+    """POST /search body.
+
+    Les défauts (termes, sources, profondeur, fenêtre) viennent de la config
+    centralisée (settings, section `search`) — éditables via la page Paramètres
+    et résolus À CHAQUE requête, pas au chargement du module.
+
+    Historique sources (utile avant de réactiver quoi que ce soit) :
+      - glassdoor : DataDome 403 ; himalayas : Cloudflare challenge (__cf_chl)
+      - remotive / greenhouse / workday : 0 résultat sur profil FR (retirés 2026-06-06)
+      - apec / wttj réactivés 2026-06-06 (webservice JSON httpx / Playwright).
+    """
 
     search_terms: list[str] = Field(
-        default_factory=lambda: list(SEARCH_TERMS),
+        default_factory=lambda: list(app_settings.get().search.search_terms),
         description="Search terms; one JobSpy query is issued per term.",
     )
     profile: str = Field(
         default=DEFAULT_PROFILE,
-        description=(
-            "Geographic profile name (see GEO_PROFILES). Pick one of "
-            "France, Suisse, Luxembourg, Belgique, Canada (QC), La Réunion, Martinique."
-        ),
+        description="Geographic profile name (see GEO_PROFILES).",
     )
     # These are legacy direct overrides — if the caller doesn't pass a profile, they can
     # still drive location+country manually. Kept for backward compat.
     location: Optional[str] = None
     country: Optional[str] = None
 
-    # NOTE: 3 sources retirees (anti-bot/login wall - non recuperables sans proxy residentiel ou compte authentifie):
-    #   - glassdoor : Datadome 403
-    #   - himalayas : Cloudflare challenge (__cf_chl)
-    #   - apec     : login wall obligatoire depuis APEC site update
-    sites: list[Platform] = ["linkedin", "indeed", "remotive", "francetravail", "freework", "greenhouse", "workday"]
-    results_per_term: int = Field(default=20, ge=1, le=100)
-    hours_old: int = Field(default=48, ge=1, description="Only jobs posted within N hours.")
+    sites: list[Platform] = Field(
+        default_factory=lambda: list(app_settings.get().search.sites),
+    )
+    results_per_term: int = Field(
+        default_factory=lambda: app_settings.get().search.results_per_term, ge=1, le=100,
+    )
+    hours_old: int = Field(
+        default_factory=lambda: app_settings.get().search.hours_old, ge=1,
+        description="Only jobs posted within N hours.",
+    )
     score_new_jobs: bool = True
 
 
@@ -106,7 +118,7 @@ class JobOut(BaseModel):
     score_freshness: Optional[float] = None  # freshness component
 
     # --- Phase 3 additions (Kanban) ---
-    application_status: Optional[str] = None  # to_study / interesting / applied / interview / closed
+    application_status: Optional[str] = None  # to_study / interesting / applied / interview / in_process / closed
     applied_date: Optional[date] = None
     notes: Optional[str] = None
     archived: bool = False
@@ -115,7 +127,7 @@ class JobOut(BaseModel):
 class ApplicationStatusUpdate(BaseModel):
     """POST /jobs/{id}/status body."""
     status: Optional[
-        Literal["to_study", "interesting", "applied", "interview", "closed"]
+        Literal["to_study", "interesting", "applied", "interview", "in_process", "closed"]
     ] = Field(
         None,
         description="New status. Pass null (or omit) to remove the offer from the pipeline.",

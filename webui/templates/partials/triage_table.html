@@ -1,0 +1,45 @@
+<div class="pager">
+  <button {{ 'disabled' if page == 0 }}
+    hx-get="/triage/table?page=0" hx-include="#tri-filters" hx-target="#tri-zone">◀◀</button>
+  <button {{ 'disabled' if page == 0 }}
+    hx-get="/triage/table?page={{ page - 1 }}" hx-include="#tri-filters" hx-target="#tri-zone">◀</button>
+  <span class="info">page {{ page + 1 }} / {{ n_pages }} · {{ items|length }} affichées sur {{ total }}</span>
+  <button {{ 'disabled' if page >= n_pages - 1 }}
+    hx-get="/triage/table?page={{ page + 1 }}" hx-include="#tri-filters" hx-target="#tri-zone">▶</button>
+  <button {{ 'disabled' if page >= n_pages - 1 }}
+    hx-get="/triage/table?page={{ n_pages - 1 }}" hx-include="#tri-filters" hx-target="#tri-zone">▶▶</button>
+</div>
+
+<div class="card" style="margin:0"><div style="overflow-x:auto">
+<table class="tri">
+  <colgroup>
+    {% if not request.state.readonly %}<col style="width:34px">{% endif %}
+    <col style="width:56px"><col style="width:92px"><col>
+    <col style="width:160px"><col style="width:140px"><col style="width:74px">
+    <col style="width:54px"><col style="width:96px"><col style="width:64px">
+  </colgroup>
+  <thead><tr>
+    {% if not request.state.readonly %}<th><input type="checkbox" id="tri-ck-all"></th>{% endif %}
+    <th>score</th><th>src</th><th>titre</th><th>société</th>
+    <th>lieu</th><th>mode</th><th>âge</th><th>salaire</th><th></th>
+  </tr></thead>
+  <tbody>
+  {% for j in items %}
+  <tr class="anim-li">
+    {% if not request.state.readonly %}<td><input type="checkbox" class="tri-ck" value="{{ j.id }}"></td>{% endif %}
+    <td><span class="score {{ j.relevance_score|score_class }}">{{ j.relevance_score|fmt_score }}</span></td>
+    <td>{{ j.platform }}</td>
+    <td title="{{ j.title }}">{{ j.title[:80] }}</td>
+    <td>{{ (j.company or '')[:30] }}</td>
+    <td>{{ (j.location or '')[:24] }}</td>
+    <td>{{ WORK_MODE_LABEL.get(j.work_mode, '') }}</td>
+    <td>{{ j|fmt_age }}</td>
+    <td>{{ j|fmt_salary }}</td>
+    <td><a href="{{ j.job_url }}" target="_blank" rel="noopener">ouvrir</a></td>
+  </tr>
+  {% else %}
+  <tr><td colspan="{{ 10 if not request.state.readonly else 9 }}" style="text-align:center;color:var(--dim);padding:30px">aucune offre</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div></div>

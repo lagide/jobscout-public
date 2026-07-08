@@ -1,0 +1,80 @@
+<div class="card anim-pop" style="margin:0">
+<div class="card__h"><div class="dots"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i></div>
+  <span class="card__t">job/{{ j.id }}</span></div>
+<div class="card__b">
+  <div style="font-size:.66rem;color:{{ fam.hue }};letter-spacing:1.4px;margin-bottom:6px">■ {{ fam.label }}</div>
+  <h2 style="font-size:1.15rem;margin-bottom:8px">{{ j.title }}</h2>
+  <div style="font-size:.78rem;color:var(--txt2);margin-bottom:14px">
+    {{ j.company or '—' }} · {{ j.location or '—' }} · {{ j.platform }} · {{ j|fmt_age }}
+  </div>
+
+  <div style="display:flex;gap:18px;align-items:center;margin-bottom:14px">
+    <div style="text-align:center;flex:none">
+      <div class="score {{ j.base_score|score_class }}" style="font-size:2.6rem">{{ j.base_score|fmt_score }}</div>
+      <div style="font-size:.56rem;letter-spacing:1px;color:var(--dim);margin-top:4px">SCORE CONTENU</div>
+    </div>
+    <div style="flex:1">
+      {% for label, val, final in [('géo', j.score_geo, false), ('salaire', j.score_salary, false), ('fraîcheur', j.score_freshness, false), ('FINAL', j.relevance_score, true)] %}
+      <div class="sbar"><span class="l">{{ label }}</span>
+        <span class="tr"><span class="fl {{ 'final' if final }}" data-w="{{ ((val or 0) * 10)|round|int }}"></span></span>
+        <span class="n">{{ val|fmt_score }}</span></div>
+      {% endfor %}
+    </div>
+  </div>
+
+  {% if j.relevance_reasoning %}
+  <div style="font-size:.62rem;letter-spacing:1.4px;color:var(--dim);margin-bottom:4px">JUSTIFICATION IA</div>
+  <div class="reason">{{ j.relevance_reasoning }}</div>
+  {% endif %}
+
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin:10px 0">
+    {% set sal = j|fmt_salary %}
+    {% if sal %}<span class="tag tag--yellow">💰 {{ sal }}</span>{% endif %}
+    {% if j.salary_effective_eur %}<span class="tag">≈ {{ j.salary_effective_eur|round|int }}€ effectif</span>{% endif %}
+    {% if j.work_mode %}<span class="tag {{ 'tag--green' if j.work_mode=='full_remote' else 'tag--cyan' if j.work_mode=='hybrid' }}">{{ WORK_MODE_LABEL.get(j.work_mode, j.work_mode) }}</span>{% endif %}
+    {% if j.language %}<span class="tag">🌐 {{ j.language }}</span>{% endif %}
+    {% if j.job_type %}<span class="tag">{{ j.job_type }}</span>{% endif %}
+    {% if j.archived %}<span class="tag tag--yellow">ARCHIVÉE</span>{% endif %}
+  </div>
+
+  {% if j.description %}
+  <div style="font-size:.62rem;letter-spacing:1.4px;color:var(--dim);margin-bottom:4px">DESCRIPTION</div>
+  <div class="desc">{{ j.description[:3000] }}{% if j.description|length > 3000 %}
+
+[…tronquée — voir la source]{% endif %}</div>
+  {% endif %}
+
+  {% if j.sources and j.sources|length > 1 %}
+  <div style="font-size:.7rem;color:var(--txt2);margin:8px 0">vue aussi sur :
+    {% for s in j.sources %}<a href="{{ s.url }}" target="_blank" rel="noopener">{{ s.platform }}</a>{{ ' · ' if not loop.last }}{% endfor %}
+  </div>
+  {% endif %}
+
+  <div style="display:flex;gap:8px;margin:14px 0 10px;flex-wrap:wrap">
+    <a class="btn primary" href="{{ j.job_url }}" target="_blank" rel="noopener">🔗 ouvrir la source</a>
+    {% if not request.state.readonly %}
+    <select hx-post="/actions/status/{{ j.id }}" hx-target="#of-detail" hx-swap="innerHTML"
+            name="status" hx-include="this">
+      <option value="" {{ 'selected' if not j.application_status }}>— non suivi</option>
+      {% for k in KANBAN_ORDER %}
+      <option value="{{ k }}" {{ 'selected' if j.application_status == k }}>{{ STATUS[k].glyph }} {{ STATUS[k].label }}</option>
+      {% endfor %}
+    </select>
+    <form hx-post="/actions/archive/{{ j.id }}" hx-target="#of-detail" hx-swap="innerHTML" style="display:inline">
+      <input type="hidden" name="archived" value="{{ 'false' if j.archived else 'true' }}">
+      <button type="submit">{{ '♻️ désarchiver' if j.archived else '🗑 archiver' }}</button>
+    </form>
+    {% endif %}
+  </div>
+
+  {% if not request.state.readonly %}
+  <form hx-post="/actions/notes/{{ j.id }}" hx-target="#notes-fb" hx-swap="innerHTML">
+    <textarea name="notes" rows="3" style="width:100%" placeholder="notes perso…">{{ j.notes or '' }}</textarea>
+    <div style="display:flex;gap:10px;align-items:center;margin-top:6px">
+      <button type="submit">💾 sauver notes</button>
+      <span id="notes-fb"></span>
+    </div>
+  </form>
+  {% endif %}
+</div>
+</div>

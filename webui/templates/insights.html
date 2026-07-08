@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}insights{% endblock %}
+{% block content %}
+<div class="phead"><span class="mk">&gt;pds</span><h1>insights</h1>
+  <span class="meta">echarts · données live</span></div>
+<div class="prompt">analytics · {{ sys_stats.total_jobs if sys_stats else '—' }} offres · {{ (sys_stats.by_platform or {})|length if sys_stats else 0 }} sources</div>
+
+<div class="grid2">
+  <div class="card"><div class="card__h"><div class="dots"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i></div><span class="card__t">volume_par_source</span></div><div id="c_src" class="chart"></div></div>
+  <div class="card"><div class="card__h"><div class="dots"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i></div><span class="card__t">mode_de_travail</span></div><div id="c_mode" class="chart"></div></div>
+</div>
+<div class="grid2">
+  <div class="card"><div class="card__h"><div class="dots"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i></div><span class="card__t">distribution_scores</span></div><div id="c_dist" class="chart"></div></div>
+  <div class="card"><div class="card__h"><div class="dots"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i></div><span class="card__t">profil_score_moyen</span></div><div id="c_radar" class="chart"></div></div>
+</div>
+<div class="grid2">
+  <div class="card"><div class="card__h"><div class="dots"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i></div><span class="card__t">top_entreprises</span></div><div id="c_co" class="chart tall"></div></div>
+  <div class="card"><div class="card__h"><div class="dots"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i></div><span class="card__t">acquisition_14j</span></div><div id="c_time" class="chart tall"></div></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<!-- ECharts via jsdelivr (autorisé par la CSP Traefik du VPS ; cdnjs ne l'est pas) -->
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<script>
+const D = {{ chart_data | tojson }};
+const GREEN='#00FF41',GDIM='#00CC33',CYAN='#00D4FF',YEL='#FFD700',
+      TXT='#D8E2EC',TXT2='#8899AA',BORDER='#1E3044';
+const FM='JetBrains Mono, monospace';
+const base={textStyle:{fontFamily:FM,color:TXT},
+  grid:{left:8,right:20,top:18,bottom:8,containLabel:true},
+  tooltip:{backgroundColor:'#0A0E18',borderColor:BORDER,textStyle:{color:TXT,fontFamily:FM}}};
+const ax=()=>({axisLine:{lineStyle:{color:BORDER}},
+  axisLabel:{color:TXT2,fontFamily:FM,fontSize:11},
+  splitLine:{lineStyle:{color:'rgba(30,48,68,.5)'}}});
+const mk=(id,opt)=>echarts.init(document.getElementById(id)).setOption(opt);
+
+mk('c_src',{...base,
+  xAxis:{...ax(),type:'value'},
+  yAxis:{...ax(),type:'category',data:D.src.labels,splitLine:{show:false}},
+  series:[{type:'bar',data:D.src.values,barWidth:'62%',
+    itemStyle:{borderRadius:[0,3,3,0],
+      color:new echarts.graphic.LinearGradient(0,0,1,0,[{offset:0,color:'#1E3044'},{offset:1,color:GREEN}])},
+    label:{show:true,position:'right',color:TXT2,fontFamily:FM,fontSize:11}}]});
+
+const modeColors={'(inconnu)':TXT2,onsite:'#5a6a7e',full_remote:GREEN,hybrid:CYAN};
+mk('c_mode',{...base,
+  legend:{bottom:0,textStyle:{color:TXT2,fontFamily:FM,fontSize:11},icon:'rect'},
+  series:[{type:'pie',radius:['48%','72%'],center:['50%','44%'],
+    data:D.modes.map(m=>({...m,itemStyle:{color:modeColors[m.name]||YEL}})),
+    label:{color:TXT,fontFamily:FM,fontSize:11,formatter:'{b}\n{d}%'},
+    labelLine:{lineStyle:{color:BORDER}},
+    itemStyle:{borderColor:'#000',borderWidth:2}}]});
+
+const distColors=['#5a6a7e',TXT2,YEL,GDIM,GREEN];
+mk('c_dist',{...base,
+  xAxis:{...ax(),type:'category',data:D.dist.labels},
+  yAxis:{...ax(),type:'value'},
+  series:[{type:'bar',barWidth:'52%',
+    data:D.dist.values.map((v,i)=>({value:v,itemStyle:{color:distColors[i],borderRadius:[3,3,0,0]}})),
+    label:{show:true,position:'top',color:TXT2,fontFamily:FM,fontSize:11}}]});
+
+mk('c_radar',{...base,
+  radar:{indicator:[{name:'contenu',max:10},{name:'géo',max:10},
+    {name:'salaire',max:10},{name:'fraîcheur',max:10}],
+    center:['50%','52%'],radius:'62%',
+    axisName:{color:TXT2,fontFamily:FM,fontSize:11},
+    splitLine:{lineStyle:{color:BORDER}},
+    splitArea:{areaStyle:{color:['rgba(0,255,65,.02)','rgba(0,0,0,0)']}},
+    axisLine:{lineStyle:{color:BORDER}}},
+  series:[{type:'radar',data:[{value:D.axes,
+    areaStyle:{color:'rgba(0,255,65,.15)'},
+    lineStyle:{color:GREEN,width:2},itemStyle:{color:GREEN}}]}]});
+
+mk('c_co',{...base,
+  xAxis:{...ax(),type:'value'},
+  yAxis:{...ax(),type:'category',data:D.top_co.labels,splitLine:{show:false},
+    axisLabel:{color:TXT2,fontFamily:FM,fontSize:10,width:120,overflow:'truncate'}},
+  series:[{type:'bar',data:D.top_co.values,barWidth:'60%',
+    itemStyle:{color:'#1E3044',borderRadius:[0,3,3,0]},
+    emphasis:{itemStyle:{color:GDIM}},
+    label:{show:true,position:'right',color:TXT2,fontFamily:FM,fontSize:10}}]});
+
+mk('c_time',{...base,
+  legend:{top:0,right:8,textStyle:{color:TXT2,fontFamily:FM,fontSize:11},icon:'rect'},
+  tooltip:{...base.tooltip,trigger:'axis',axisPointer:{type:'shadow'}},
+  grid:{left:8,right:20,top:34,bottom:8,containLabel:true},
+  xAxis:{...ax(),type:'category',data:D.time.days},
+  yAxis:{...ax(),type:'value'},
+  series:[{name:'nouvelles',type:'bar',stack:'a',data:D.time.new,itemStyle:{color:GREEN}},
+          {name:'doublons',type:'bar',stack:'a',data:D.time.dup,itemStyle:{color:'#1E3044'}}]});
+
+addEventListener('resize',()=>document.querySelectorAll('.chart')
+  .forEach(e=>echarts.getInstanceByDom(e)?.resize()));
+</script>
+{% endblock %}
